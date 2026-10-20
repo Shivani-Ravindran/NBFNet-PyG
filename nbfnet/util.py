@@ -51,8 +51,21 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("-c", "--config", help="yaml configuration file", required=True)
     parser.add_argument("-s", "--seed", help="random seed for PyTorch", type=int, default=1024)
+    parser.add_argument("--selector", type=str, default="learned",
+                        choices=["full", "random", "learned", "astar"],
+                        help="pruning selector (default: learned)")
+    parser.add_argument("--modified_loss", type=str, default="false",
+                        choices=["true", "false"],
+                        help="enable distance-to-target auxiliary loss (default: false)")
+    parser.add_argument("--aux_weight", type=float, default=0.1,
+                        help="lambda for auxiliary loss (default: 0.1)")
+    parser.add_argument("--rho", type=float, default=0.5,
+                        help="message budget fraction (default: 0.5)")
+    parser.add_argument("--explore", type=float, default=0.1,
+                        help="exploration fraction for learned selector (default: 0.1)")
 
     args, unparsed = parser.parse_known_args()
+    args.modified_loss = args.modified_loss == "true"
     # get dynamic arguments defined in the config file
     vars = detect_variables(args.config)
     parser = argparse.ArgumentParser()

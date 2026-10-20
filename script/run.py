@@ -1,3 +1,5 @@
+#Run command: python script/run.py -c config/inductive/fb15k237.yaml --version v1
+
 import os
 import sys
 import math
@@ -13,6 +15,8 @@ from torch_geometric.data import Data
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from nbfnet import tasks, util
+
+from pruned_models import PrunedNBFNet
 
 
 separator = ">" * 30
@@ -66,14 +70,16 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None):
                     neg_weight[:, 1:] = 1 / cfg.task.num_negative
                 loss = (loss * neg_weight).sum(dim=-1) / neg_weight.sum(dim=-1)
                 loss = loss.mean()
-
+                main_loss = loss.item()
+                dist_loss = model.aux_loss.item()
+                loss = loss + model.aux_loss
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
 
                 if util.get_rank() == 0 and batch_id % cfg.train.log_interval == 0:
                     logger.warning(separator)
-                    logger.warning("binary cross entropy: %g" % loss)
+                    logger.warning("main_loss: %g  dist_loss: %g  total: %g" % (main_loss, dist_loss, loss.item()))
                 losses.append(loss.item())
                 batch_id += 1
 
@@ -104,7 +110,7 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None):
 
     if rank == 0:
         logger.warning("Load checkpoint from model_epoch_%d.pth" % best_epoch)
-    state = torch.load("model_epoch_%d.pth" % best_epoch, map_location=device)
+    state = torch.load("model_epoch_%d.pth" % best_epoch, map_location=device,weights_only=False)
     model.load_state_dict(state["model"])
     util.synchronize()
 
@@ -197,7 +203,12 @@ if __name__ == "__main__":
     is_inductive = cfg.dataset["class"].startswith("Ind")
     dataset = util.build_dataset(cfg)
     cfg.model.num_relation = dataset.num_relations
-    model = util.build_model(cfg)
+    cfg.model.pop("class", None)
+    model = PrunedNBFNet(selector=args.selector, rho=args.rho, explore=args.explore,
+                         aux_weight=args.aux_weight, modified_loss=args.modified_loss, **cfg.model)
+    if util.get_rank() == 0:
+        logger.warning("Pruning config: selector=%s  modified_loss=%s  aux_weight=%g  rho=%g  explore=%g" %
+                       (args.selector, args.modified_loss, args.aux_weight, args.rho, args.explore))
 
     device = util.get_device(cfg)
     model = model.to(device)
@@ -222,3 +233,4 @@ if __name__ == "__main__":
         logger.warning(separator)
         logger.warning("Evaluate on test")
     test(cfg, model, test_data, filtered_data=filtered_data)
+

@@ -4,7 +4,7 @@ from collections.abc import Sequence
 import torch
 from torch import nn, autograd
 
-from torch_scatter import scatter_add
+from nbfnet.scatter_compat import scatter_add
 from . import tasks, layers
 
 

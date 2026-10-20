@@ -27,7 +27,7 @@ class IndRelLinkPredDataset(InMemoryDataset):
         assert name in ["FB15k-237", "WN18RR"]
         assert version in ["v1", "v2", "v3", "v4"]
         super().__init__(root, transform, pre_transform)
-        self.data, self.slices = torch.load(self.processed_paths[0])
+        self.data, self.slices = torch.load(self.processed_paths[0], weights_only= False)
 
     @property
     def num_relations(self):

@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch_scatter import scatter
+from nbfnet.scatter_compat import scatter
 
 from torch_geometric.nn.conv import MessagePassing
 from torch_geometric.utils import degree
