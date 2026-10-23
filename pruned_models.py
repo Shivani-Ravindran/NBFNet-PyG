@@ -55,9 +55,21 @@ def select_nodes(score, cand, outdeg, budget, force_first):
     return torch.zeros_like(cand).scatter(1, order, keep)
 
 
+def _build_mlp(in_dim, hidden_dim, out_dim, depth):
+    if depth == 1:
+        return nn.Sequential(nn.Linear(in_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, out_dim))
+    elif depth == 2:
+        return nn.Sequential(
+            nn.Linear(in_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, out_dim)
+        )
+    raise ValueError("scorer_depth must be 1 or 2, got %s" % depth)
+
+
 class PrunedNBFNet(NBFNet):
     def __init__(self, selector="learned", rho=0.5, explore=0.1, aux_weight=0.0,
-                 modified_loss=False, **kwargs):
+                 modified_loss=False, scorer_dim=32, scorer_depth=1, **kwargs):
         super().__init__(**kwargs)
         assert selector in ("full", "random", "learned", "astar")
         if modified_loss and selector not in SCORER_SELECTORS:
@@ -68,6 +80,7 @@ class PrunedNBFNet(NBFNet):
         assert len(set(self.dims)) == 1, "all hidden dims must equal input_dim"
         self.selector, self.rho, self.explore = selector, rho, explore
         self.aux_weight, self.modified_loss = aux_weight, modified_loss
+        self.scorer_dim, self.scorer_depth = scorer_dim, scorer_depth
         d = self.dims[0]
         self.layers = nn.ModuleList(
             MaskedConv(self.dims[i], self.dims[i + 1], kwargs["num_relation"], d,
@@ -75,10 +88,10 @@ class PrunedNBFNet(NBFNet):
             for i in range(len(self.dims) - 1)
         )
         # "learned" scorer (shared across layers)
-        self.scorer = nn.Sequential(nn.Linear(2 * d, d), nn.ReLU(), nn.Linear(d, 1))
+        self.scorer = _build_mlp(2 * d, scorer_dim, 1, scorer_depth)
         # "astar" scorer (A*Net-style, separate parameters)
         self.astar_query_proj = nn.Linear(2 * d, d)
-        self.astar_mlp = nn.Sequential(nn.Linear(d, d), nn.ReLU(), nn.Linear(d, 1))
+        self.astar_mlp = _build_mlp(d, scorer_dim, 1, scorer_depth)
         self.aux_loss = torch.zeros(())
         self.stats, self.last_reached, self._t_pos = {}, None, None
 

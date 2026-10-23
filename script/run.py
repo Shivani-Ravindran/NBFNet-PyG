@@ -203,10 +203,11 @@ if __name__ == "__main__":
     cfg.model.num_relation = dataset.num_relations
     cfg.model.pop("class", None)
     model = PrunedNBFNet(selector=args.selector, rho=args.rho, explore=args.explore,
-                         aux_weight=args.aux_weight, modified_loss=args.modified_loss, **cfg.model)
+                         aux_weight=args.aux_weight, modified_loss=args.modified_loss,
+                         scorer_dim=args.scorer_dim, scorer_depth=args.scorer_depth, **cfg.model)
     if util.get_rank() == 0:
-        logger.warning("Pruning config: selector=%s  modified_loss=%s  aux_weight=%g  rho=%g  explore=%g" %
-                       (args.selector, args.modified_loss, args.aux_weight, args.rho, args.explore))
+        logger.warning("Pruning config: selector=%s  modified_loss=%s  aux_weight=%g  rho=%g  explore=%g  scorer_dim=%d  scorer_depth=%d" %
+                       (args.selector, args.modified_loss, args.aux_weight, args.rho, args.explore, args.scorer_dim, args.scorer_depth))
 
     device = util.get_device(cfg)
     model = model.to(device)

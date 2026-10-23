@@ -63,6 +63,10 @@ def parse_args():
                         help="message budget fraction (default: 0.5)")
     parser.add_argument("--explore", type=float, default=0.1,
                         help="exploration fraction for learned selector (default: 0.1)")
+    parser.add_argument("--scorer_dim", type=int, default=32,
+                        help="hidden dimension of scorer MLP (default: 32)")
+    parser.add_argument("--scorer_depth", type=int, default=1, choices=[1, 2],
+                        help="number of hidden layers in scorer MLP (default: 1)")
 
     args, unparsed = parser.parse_known_args()
     args.modified_loss = args.modified_loss == "true"
