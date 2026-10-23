@@ -1,5 +1,3 @@
-#Run command: python script/run.py -c config/inductive/fb15k237.yaml --version v1
-
 import os
 import sys
 import math
