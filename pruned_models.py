@@ -1,11 +1,4 @@
-"""
-Budgeted node expansion for NBFNet (NBFNet-PyG).
-Drop this file next to run.py (repo root) and import PrunedNBFNet instead of NBFNet.
 
-selector: "full" | "random" | "learned" | "astar"
-rho:      fraction of |E| allowed to send messages per layer
-Pruning is done by masking (simulated savings), see stats["edges_frac"].
-"""
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -55,21 +48,9 @@ def select_nodes(score, cand, outdeg, budget, force_first):
     return torch.zeros_like(cand).scatter(1, order, keep)
 
 
-def _build_mlp(in_dim, hidden_dim, out_dim, depth):
-    if depth == 1:
-        return nn.Sequential(nn.Linear(in_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, out_dim))
-    elif depth == 2:
-        return nn.Sequential(
-            nn.Linear(in_dim, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, out_dim)
-        )
-    raise ValueError("scorer_depth must be 1 or 2, got %s" % depth)
-
-
 class PrunedNBFNet(NBFNet):
     def __init__(self, selector="learned", rho=0.5, explore=0.1, aux_weight=0.0,
-                 modified_loss=False, scorer_dim=32, scorer_depth=1, **kwargs):
+                 modified_loss=False, **kwargs):
         super().__init__(**kwargs)
         assert selector in ("full", "random", "learned", "astar")
         if modified_loss and selector not in SCORER_SELECTORS:
@@ -80,18 +61,17 @@ class PrunedNBFNet(NBFNet):
         assert len(set(self.dims)) == 1, "all hidden dims must equal input_dim"
         self.selector, self.rho, self.explore = selector, rho, explore
         self.aux_weight, self.modified_loss = aux_weight, modified_loss
-        self.scorer_dim, self.scorer_depth = scorer_dim, scorer_depth
         d = self.dims[0]
         self.layers = nn.ModuleList(
             MaskedConv(self.dims[i], self.dims[i + 1], kwargs["num_relation"], d,
                        kwargs.get("layer_norm", False), kwargs.get("dependent", True))
             for i in range(len(self.dims) - 1)
         )
-        # "learned" scorer (shared across layers)
-        self.scorer = _build_mlp(2 * d, scorer_dim, 1, scorer_depth)
+        # "learned" scorer (shared across layers): 2 hidden layers x 64 units (config D)
+        self.scorer = nn.Sequential(nn.Linear(2 * d, 64), nn.ReLU(), nn.Linear(64, 64), nn.ReLU(), nn.Linear(64, 1))
         # "astar" scorer (A*Net-style, separate parameters)
         self.astar_query_proj = nn.Linear(2 * d, d)
-        self.astar_mlp = _build_mlp(d, scorer_dim, 1, scorer_depth)
+        self.astar_mlp = nn.Sequential(nn.Linear(d, 64), nn.ReLU(), nn.Linear(64, 64), nn.ReLU(), nn.Linear(64, 1))
         self.aux_loss = torch.zeros(())
         self.stats, self.last_reached, self._t_pos = {}, None, None
 
@@ -189,7 +169,7 @@ class PrunedNBFNet(NBFNet):
         reached[ar, h_index] = True
         outdeg = torch.bincount(src, minlength=V).float()
 
-        use_aux = (self.training and self.modified_loss
+        use_aux = (self.training and self.modified_loss and self.aux_weight > 0
                    and self.selector in SCORER_SELECTORS and self._t_pos is not None)
         dist = self._dist_to_target(data.edge_index, V, self._t_pos, len(self.layers)) if use_aux else None
         aux, edges_frac, nodes_frac = [], [], []
@@ -222,7 +202,7 @@ class PrunedNBFNet(NBFNet):
             edges_frac.append((sel.float() * outdeg).sum(1).mean().item() / E)
             nodes_frac.append(sel.float().sum(1).mean().item() / V)
 
-        self.aux_loss = torch.stack(aux).mean() * self.aux_weight if aux else torch.zeros((), device=dev)
+        self.aux_loss = (torch.stack(aux).mean() * self.aux_weight) if (aux and self.aux_weight > 0) else torch.zeros((), device=dev)
         self.last_reached = reached
         self.stats = {"edges_frac": edges_frac, "nodes_frac": nodes_frac}
 
@@ -231,5 +211,20 @@ class PrunedNBFNet(NBFNet):
         return {"node_feature": out, "edge_weights": [None] * len(self.layers)}
 
     def forward(self, data, batch):
-        self._t_pos = batch[:, 0, 1] if self.training else None  # column 0 = positive tail
-        return super().forward(data, batch)
+        h_index, t_index, r_index = batch.unbind(-1)
+        if self.training:
+            data = self.remove_easy_edges(data, h_index, t_index, r_index)
+        shape = h_index.shape
+        h_index, t_index, r_index = self.negative_sample_to_tail(h_index, t_index, r_index)
+        assert (h_index[:, [0]] == h_index).all()
+        assert (r_index[:, [0]] == r_index).all()
+
+        # column 0 is the positive target after negative_sample_to_tail for both head and tail queries
+        self._t_pos = t_index[:, 0] if self.training else None
+
+        output = self.bellmanford(data, h_index[:, 0], r_index[:, 0])
+        feature = output["node_feature"]
+        index = t_index.unsqueeze(-1).expand(-1, -1, feature.shape[-1])
+        feature = feature.gather(1, index)
+        score = self.mlp(feature).squeeze(-1)
+        return score.view(shape)
