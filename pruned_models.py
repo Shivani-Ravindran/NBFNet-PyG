@@ -49,7 +49,7 @@ def select_nodes(score, cand, outdeg, budget, force_first):
 
 
 class PrunedNBFNet(NBFNet):
-    def __init__(self, selector="learned", rho=0.5, explore=0.1, aux_weight=0.0,
+    def __init__(self, selector="learned", rho=0.5, explore=0.2, aux_weight=0.5,
                  modified_loss=False, **kwargs):
         super().__init__(**kwargs)
         assert selector in ("full", "random", "learned", "astar")
