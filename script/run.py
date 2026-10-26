@@ -35,7 +35,7 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None):
     cls = cfg.optimizer.pop("class")
     optimizer = getattr(optim, cls)(model.parameters(), **cfg.optimizer)
     if world_size > 1:
-        parallel_model = nn.parallel.DistributedDataParallel(model, device_ids=[device])
+        parallel_model = nn.parallel.DistributedDataParallel(model, device_ids=[device], find_unused_parameters=True)
     else:
         parallel_model = model
 
@@ -50,9 +50,16 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None):
             if util.get_rank() == 0:
                 logger.warning(separator)
                 logger.warning("Epoch %d begin" % epoch)
+                if hasattr(model, "warmup_epochs") and model.warmup_epochs > 0:
+                    if epoch < model.warmup_epochs:
+                        logger.warning("Warm-up active: epoch %d / %d (full message passing)" % (epoch + 1, model.warmup_epochs))
+                    elif epoch == model.warmup_epochs:
+                        logger.warning("Warm-up completed: enabling '%s' pruning selector" % getattr(model, "selector", "pruned"))
 
             losses = []
             sampler.set_epoch(epoch)
+            if hasattr(model, "set_epoch"):
+                model.set_epoch(epoch)
             for batch in train_loader:
                 batch = tasks.negative_sampling(train_data, batch, cfg.task.num_negative,
                                                 strict=cfg.task.strict_negative)
@@ -123,6 +130,8 @@ def test(cfg, model, test_data, filtered_data=None):
     test_loader = torch_data.DataLoader(test_triplets, cfg.train.batch_size, sampler=sampler)
 
     model.eval()
+    if hasattr(model, "set_epoch"):
+        model.set_epoch(None)
     rankings = []
     num_negatives = []
     for batch in test_loader:
@@ -202,11 +211,14 @@ if __name__ == "__main__":
     dataset = util.build_dataset(cfg)
     cfg.model.num_relation = dataset.num_relations
     cfg.model.pop("class", None)
+    warmup_epochs = args.warmup_epochs if args.warmup_epochs is not None else cfg.model.get("warmup_epochs", 0)
+    cfg.model.pop("warmup_epochs", None)
     model = PrunedNBFNet(selector=args.selector, rho=args.rho, explore=args.explore,
-                         aux_weight=args.aux_weight, modified_loss=args.modified_loss, **cfg.model)
+                         aux_weight=args.aux_weight, modified_loss=args.modified_loss,
+                         warmup_epochs=warmup_epochs, **cfg.model)
     if util.get_rank() == 0:
-        logger.warning("Pruning config: selector=%s  modified_loss=%s  aux_weight=%g  rho=%g  explore=%g" %
-                       (args.selector, args.modified_loss, args.aux_weight, args.rho, args.explore))
+        logger.warning("Pruning config: selector=%s  modified_loss=%s  aux_weight=%g  rho=%g  explore=%g  warmup_epochs=%d" %
+                       (args.selector, args.modified_loss, args.aux_weight, args.rho, args.explore, warmup_epochs))
 
     device = util.get_device(cfg)
     model = model.to(device)

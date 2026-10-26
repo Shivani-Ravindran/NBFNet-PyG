@@ -63,6 +63,8 @@ def parse_args():
                         help="message budget fraction (default: 0.5)")
     parser.add_argument("--explore", type=float, default=0.1,
                         help="exploration fraction for learned selector (default: 0.1)")
+    parser.add_argument("--warmup_epochs", type=int, default=None,
+                        help="number of warm-up epochs with full message passing before pruning (default: 0)")
 
     args, unparsed = parser.parse_known_args()
     args.modified_loss = args.modified_loss == "true"

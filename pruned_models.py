@@ -50,7 +50,7 @@ def select_nodes(score, cand, outdeg, budget, force_first):
 
 class PrunedNBFNet(NBFNet):
     def __init__(self, selector="learned", rho=0.5, explore=0.2, aux_weight=0.5,
-                 modified_loss=False, **kwargs):
+                 modified_loss=False, warmup_epochs=0, **kwargs):
         super().__init__(**kwargs)
         assert selector in ("full", "random", "learned", "astar")
         if modified_loss and selector not in SCORER_SELECTORS:
@@ -61,6 +61,8 @@ class PrunedNBFNet(NBFNet):
         assert len(set(self.dims)) == 1, "all hidden dims must equal input_dim"
         self.selector, self.rho, self.explore = selector, rho, explore
         self.aux_weight, self.modified_loss = aux_weight, modified_loss
+        self.warmup_epochs = warmup_epochs
+        self.current_epoch = None
         d = self.dims[0]
         self.layers = nn.ModuleList(
             MaskedConv(self.dims[i], self.dims[i + 1], kwargs["num_relation"], d,
@@ -74,6 +76,15 @@ class PrunedNBFNet(NBFNet):
         self.astar_mlp = nn.Sequential(nn.Linear(d, 64), nn.ReLU(), nn.Linear(64, 64), nn.ReLU(), nn.Linear(64, 1))
         self.aux_loss = torch.zeros(())
         self.stats, self.last_reached, self._t_pos = {}, None, None
+
+    def set_epoch(self, epoch):
+        self.current_epoch = epoch
+
+    @property
+    def is_in_warmup(self):
+        return (self.training and self.warmup_epochs > 0
+                and self.current_epoch is not None
+                and self.current_epoch < self.warmup_epochs)
 
     # ---------------------------------------------------------------- helpers
     @staticmethod
@@ -169,14 +180,15 @@ class PrunedNBFNet(NBFNet):
         reached[ar, h_index] = True
         outdeg = torch.bincount(src, minlength=V).float()
 
-        use_aux = (self.training and self.modified_loss and self.aux_weight > 0
+        in_warmup = self.is_in_warmup
+        use_aux = (not in_warmup and self.training and self.modified_loss and self.aux_weight > 0
                    and self.selector in SCORER_SELECTORS and self._t_pos is not None)
         dist = self._dist_to_target(data.edge_index, V, self._t_pos, len(self.layers)) if use_aux else None
         aux, edges_frac, nodes_frac = [], [], []
 
         h, hiddens = boundary, []
         for layer in self.layers:
-            if self.selector == "full":
+            if in_warmup or self.selector == "full":
                 sel, node_gate = reached, torch.ones(B, V, device=dev)
                 esel = sel[:, src]
                 gate = esel.float() * node_gate[:, src]
