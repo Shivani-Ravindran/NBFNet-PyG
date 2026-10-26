@@ -200,8 +200,8 @@ class PrunedNBFNet(NBFNet):
                  # ── pruning ──────────────────────────────────────────
                  selector="learned",
                  rho=0.5,
-                 explore=0.1,
-                 aux_weight=0.0,
+                 explore=0.2,
+                 aux_weight=0.5,
                  modified_loss=False,
                  # ── scorer capacity (Priority 5 / docx) ─────────────
                  scorer_dim=64,
