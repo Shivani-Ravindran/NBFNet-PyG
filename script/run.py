@@ -202,11 +202,35 @@ if __name__ == "__main__":
     dataset = util.build_dataset(cfg)
     cfg.model.num_relation = dataset.num_relations
     cfg.model.pop("class", None)
-    model = PrunedNBFNet(selector=args.selector, rho=args.rho, explore=args.explore,
-                         aux_weight=args.aux_weight, modified_loss=args.modified_loss, **cfg.model)
+    model = PrunedNBFNet(
+        selector=args.selector,
+        rho=args.rho,
+        explore=args.explore,
+        aux_weight=args.aux_weight,
+        modified_loss=args.modified_loss,
+        # scorer capacity (docx: Scorer D = dim 64, depth 2)
+        scorer_dim=args.scorer_dim,
+        scorer_depth=args.scorer_depth,
+        # Priority 6: distance decay
+        distance_decay=args.distance_decay,
+        decay_rate=args.decay_rate,
+        # Priority 7: regularisation & activations
+        scorer_layer_norm=args.scorer_layer_norm,
+        scorer_dropout=args.scorer_dropout,
+        scorer_activation=args.scorer_activation,
+        **cfg.model)
     if util.get_rank() == 0:
-        logger.warning("Pruning config: selector=%s  modified_loss=%s  aux_weight=%g  rho=%g  explore=%g" %
-                       (args.selector, args.modified_loss, args.aux_weight, args.rho, args.explore))
+        logger.warning(
+            "Pruning config: selector=%s  modified_loss=%s  aux_weight=%g  "
+            "rho=%g  explore=%g  scorer_dim=%d  scorer_depth=%d" %
+            (args.selector, args.modified_loss, args.aux_weight,
+             args.rho, args.explore, args.scorer_dim, args.scorer_depth))
+        logger.warning(
+            "Priority 6 – distance_decay=%s  decay_rate=%g" %
+            (args.distance_decay, args.decay_rate))
+        logger.warning(
+            "Priority 7 – scorer_layer_norm=%s  scorer_dropout=%g  scorer_activation=%s" %
+            (args.scorer_layer_norm, args.scorer_dropout, args.scorer_activation))
 
     device = util.get_device(cfg)
     model = model.to(device)
