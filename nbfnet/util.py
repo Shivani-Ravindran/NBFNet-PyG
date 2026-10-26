@@ -63,33 +63,9 @@ def parse_args():
                         help="message budget fraction (default: 0.5)")
     parser.add_argument("--explore", type=float, default=0.1,
                         help="exploration fraction for learned selector (default: 0.1)")
-    # ── scorer capacity (per scorer_comparison.docx: best = dim 64, depth 2) ──
-    parser.add_argument("--scorer_dim", type=int, default=64,
-                        help="hidden dimension of scorer MLP (default: 64)")
-    parser.add_argument("--scorer_depth", type=int, default=2, choices=[1, 2],
-                        help="number of hidden layers in scorer MLP (default: 2)")
-
-    # ── Priority 6: distance decay formulation ────────────────────────────────
-    parser.add_argument("--distance_decay", type=str, default="harmonic",
-                        choices=["harmonic", "exponential"],
-                        help="distance supervision decay: harmonic=1/(1+d), "
-                             "exponential=exp(-rate*d) (default: harmonic)")
-    parser.add_argument("--decay_rate", type=float, default=1.0,
-                        help="temperature for exponential distance decay (default: 1.0)")
-
-    # ── Priority 7: regularisation & activations ──────────────────────────────
-    parser.add_argument("--scorer_layer_norm", type=str, default="false",
-                        choices=["true", "false"],
-                        help="enable LayerNorm in scorer MLP hidden layers (default: false)")
-    parser.add_argument("--scorer_dropout", type=float, default=0.0,
-                        help="dropout probability in scorer MLP (0=off, try 0.1 or 0.2)")
-    parser.add_argument("--scorer_activation", type=str, default="relu",
-                        choices=["relu", "gelu", "leaky_relu"],
-                        help="activation function for scorer MLP (default: relu)")
 
     args, unparsed = parser.parse_known_args()
     args.modified_loss = args.modified_loss == "true"
-    args.scorer_layer_norm = args.scorer_layer_norm == "true"
     # get dynamic arguments defined in the config file
     vars = detect_variables(args.config)
     parser = argparse.ArgumentParser()
@@ -139,11 +115,8 @@ def synchronize():
 
 
 def get_device(cfg):
-    if cfg.train.gpus and torch.cuda.is_available():
+    if cfg.train.gpus:
         device = torch.device(cfg.train.gpus[get_rank()])
-    elif cfg.train.gpus and not torch.cuda.is_available():
-        logging.getLogger("").warning("CUDA is not available on this machine. Falling back to CPU.")
-        device = torch.device("cpu")
     else:
         device = torch.device("cpu")
     return device
