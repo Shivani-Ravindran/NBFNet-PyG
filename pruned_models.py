@@ -48,9 +48,73 @@ def select_nodes(score, cand, outdeg, budget, force_first):
     return torch.zeros_like(cand).scatter(1, order, keep)
 
 
+# ─────────────────────────────────────────────────────────────────
+# Distance decay target helper – exponential, rate=0.5 (FIXED)
+# ─────────────────────────────────────────────────────────────────
+
+_DECAY_RATE = 0.5   # y = exp(-0.5 * d), proven best config
+
+
+def _compute_distance_target(dist):
+    """
+    Convert integer BFS distances to soft supervision targets in [0, 1].
+
+    Formula (fixed): y = exp(-0.5 * d)
+        - Exponential decay with rate 0.5 gives sharp, local supervision.
+        - Unreachable nodes (dist == inf) are mapped to 0.
+
+    Args:
+        dist : (B, V) float tensor of BFS distances from the target entity
+
+    Returns:
+        y    : (B, V) float tensor of target values in [0, 1]
+    """
+    y = torch.exp(-_DECAY_RATE * dist)
+    y = y.masked_fill(torch.isinf(dist), 0.0)
+    return y
+
+
+# ─────────────────────────────────────────────────────────────────
+# MLP builder – GELU, no LayerNorm, no Dropout (fixed best config)
+# ─────────────────────────────────────────────────────────────────
+def _build_mlp(in_dim, hidden_dim, out_dim, depth):
+    """
+    Build a scorer MLP with GELU activation, no LayerNorm, no Dropout.
+
+    Experimental findings (scorer_comparison.docx):
+        - GELU is the best activation (Val MRR 0.3609, Test MRR 0.3160).
+        - LayerNorm degrades test MRR (0.2507 vs 0.2837 baseline).
+        - Dropout 0.1 causes over-regularisation (Test MRR 0.2632).
+      => Structural regularisation suppresses fine-grained distance signals.
+
+    Architecture per hidden layer:
+        Linear -> GELU
+
+    Final layer:
+        Linear(hidden_dim, out_dim)
+
+    Args:
+        in_dim     : input feature size
+        hidden_dim : width of every hidden layer
+        out_dim    : output size (usually 1 for scoring)
+        depth      : number of hidden layers (1 or 2)
+    """
+    if depth not in (1, 2):
+        raise ValueError("scorer_depth must be 1 or 2, got %s" % depth)
+
+    def _hidden_block(in_f, out_f):
+        return [nn.Linear(in_f, out_f), nn.GELU()]
+
+    layers = _hidden_block(in_dim, hidden_dim)
+    if depth == 2:
+        layers += _hidden_block(hidden_dim, hidden_dim)
+    layers.append(nn.Linear(hidden_dim, out_dim))
+    return nn.Sequential(*layers)
+
+
 class PrunedNBFNet(NBFNet):
     def __init__(self, selector="learned", rho=0.5, explore=0.2, aux_weight=0.5,
-                 modified_loss=False, **kwargs):
+                 modified_loss=False, scorer_dim=64, scorer_depth=2, **kwargs):
         super().__init__(**kwargs)
         assert selector in ("full", "random", "learned", "astar")
         if modified_loss and selector not in SCORER_SELECTORS:
@@ -61,17 +125,19 @@ class PrunedNBFNet(NBFNet):
         assert len(set(self.dims)) == 1, "all hidden dims must equal input_dim"
         self.selector, self.rho, self.explore = selector, rho, explore
         self.aux_weight, self.modified_loss = aux_weight, modified_loss
+        self.scorer_dim, self.scorer_depth = scorer_dim, scorer_depth
         d = self.dims[0]
         self.layers = nn.ModuleList(
             MaskedConv(self.dims[i], self.dims[i + 1], kwargs["num_relation"], d,
                        kwargs.get("layer_norm", False), kwargs.get("dependent", True))
             for i in range(len(self.dims) - 1)
         )
-        # "learned" scorer (shared across layers): 2 hidden layers x 64 units (config D)
-        self.scorer = nn.Sequential(nn.Linear(2 * d, 64), nn.ReLU(), nn.Linear(64, 64), nn.ReLU(), nn.Linear(64, 1))
+        # ── Scorer MLPs (GELU, no LayerNorm, no Dropout) ────────────
+        # "learned" scorer (shared across layers): input = [h || query]
+        self.scorer = _build_mlp(2 * d, scorer_dim, 1, scorer_depth)
         # "astar" scorer (A*Net-style, separate parameters)
         self.astar_query_proj = nn.Linear(2 * d, d)
-        self.astar_mlp = nn.Sequential(nn.Linear(d, 64), nn.ReLU(), nn.Linear(64, 64), nn.ReLU(), nn.Linear(64, 1))
+        self.astar_mlp = _build_mlp(d, scorer_dim, 1, scorer_depth)
         self.aux_loss = torch.zeros(())
         self.stats, self.last_reached, self._t_pos = {}, None, None
 
@@ -169,9 +235,15 @@ class PrunedNBFNet(NBFNet):
         reached[ar, h_index] = True
         outdeg = torch.bincount(src, minlength=V).float()
 
-        use_aux = (self.training and self.modified_loss and self.aux_weight > 0
+        use_aux = (self.training and self.modified_loss
                    and self.selector in SCORER_SELECTORS and self._t_pos is not None)
-        dist = self._dist_to_target(data.edge_index, V, self._t_pos, len(self.layers)) if use_aux else None
+
+        # ── Distance decay targets: exp(-0.5 * d), computed once per pass ──
+        if use_aux:
+            raw_dist = self._dist_to_target(data.edge_index, V, self._t_pos, len(self.layers))
+            dist_target = _compute_distance_target(raw_dist)
+        else:
+            dist_target = None
         aux, edges_frac, nodes_frac = [], [], []
 
         h, hiddens = boundary, []
@@ -183,13 +255,11 @@ class PrunedNBFNet(NBFNet):
             elif self.selector == "astar":
                 sel, gate, esel, s = self._select_astar(h, query, reached, outdeg, src, dst, E, V)
                 if use_aux:
-                    y = torch.where(torch.isinf(dist), torch.zeros_like(dist), 1.0 / (1.0 + dist))
-                    aux.append(F.binary_cross_entropy_with_logits(s[reached], y[reached]))
+                    aux.append(F.binary_cross_entropy_with_logits(s[reached], dist_target[reached]))
             else:
                 sel, node_gate, s = self._select(h, query, reached, outdeg, E)
                 if use_aux:
-                    y = torch.where(torch.isinf(dist), torch.zeros_like(dist), 1.0 / (1.0 + dist))
-                    aux.append(F.binary_cross_entropy_with_logits(s[reached], y[reached]))
+                    aux.append(F.binary_cross_entropy_with_logits(s[reached], dist_target[reached]))
                 esel = sel[:, src]
                 gate = esel.float() * node_gate[:, src]
             recv = torch.zeros(B, V, device=dev).index_add(1, dst, esel.float()) > 0
