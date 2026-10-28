@@ -96,12 +96,20 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None):
                 stats = getattr(getattr(model, "module", model), "stats", {})
                 sparsity_dense = stats.get("sparsity_vs_dense", stats.get("physical_sparsity", 0.0)) * 100
                 sparsity_full = stats.get("sparsity_vs_full", 0.0) * 100
+                nodes_frac = stats.get("nodes_frac", [])
+                edges_frac = stats.get("edges_frac", [])
                 logger.warning(separator)
                 logger.warning("Epoch %d end" % epoch)
                 logger.warning(line)
                 logger.warning("average binary cross entropy: %g" % avg_loss)
                 logger.warning("Epoch %d efficiency: time=%.2fs  speed=%.1f triplets/s  peak_mem=%.1f MB  sparsity_vs_dense=%.1f%%  sparsity_vs_full=%.1f%%" %
                                (epoch, epoch_time, train_speed, peak_mem, sparsity_dense, sparsity_full))
+                if nodes_frac:
+                    nodes_str = ", ".join("L%d: %.1f%%" % (idx + 1, f * 100) for idx, f in enumerate(nodes_frac))
+                    logger.warning("Epoch %d nodes kept:  %s" % (epoch, nodes_str))
+                if edges_frac:
+                    edges_str = ", ".join("L%d: %.1f%%" % (idx + 1, f * 100) for idx, f in enumerate(edges_frac))
+                    logger.warning("Epoch %d edges kept:  %s" % (epoch, edges_str))
 
         epoch = min(cfg.train.num_epoch, i + step)
         if rank == 0:
@@ -147,10 +155,15 @@ def test(cfg, model, test_data, filtered_data=None):
     model.eval()
     rankings = []
     num_negatives = []
+    tail_coverages = []
+    head_coverages = []
     for batch in test_loader:
         t_batch, h_batch = tasks.all_negative(test_data, batch)
         t_pred = model(test_data, t_batch)
+        m = getattr(model, "module", model)
+        t_reached = getattr(m, "last_reached", None)
         h_pred = model(test_data, h_batch)
+        h_reached = getattr(m, "last_reached", None)
 
         if filtered_data is None:
             t_mask, h_mask = tasks.strict_negative_mask(test_data, batch)
@@ -164,6 +177,13 @@ def test(cfg, model, test_data, filtered_data=None):
 
         rankings += [t_ranking, h_ranking]
         num_negatives += [num_t_negative, num_h_negative]
+
+        if t_reached is not None:
+            t_covered = t_reached[torch.arange(len(pos_t_index), device=pos_t_index.device), pos_t_index].float()
+            tail_coverages.append(t_covered)
+        if h_reached is not None:
+            h_covered = h_reached[torch.arange(len(pos_h_index), device=pos_h_index.device), pos_h_index].float()
+            head_coverages.append(h_covered)
 
     ranking = torch.cat(rankings)
     num_negative = torch.cat(num_negatives)
@@ -180,6 +200,27 @@ def test(cfg, model, test_data, filtered_data=None):
         dist.all_reduce(all_ranking, op=dist.ReduceOp.SUM)
         dist.all_reduce(all_num_negative, op=dist.ReduceOp.SUM)
 
+    all_tail_cov = None
+    all_head_cov = None
+    if len(tail_coverages) > 0:
+        tail_cov = torch.cat(tail_coverages)
+        head_cov = torch.cat(head_coverages) if len(head_coverages) > 0 else None
+        cov_size = torch.zeros(world_size, dtype=torch.long, device=device)
+        cov_size[rank] = len(tail_cov)
+        if world_size > 1:
+            dist.all_reduce(cov_size, op=dist.ReduceOp.SUM)
+        cum_cov_size = cov_size.cumsum(0)
+        all_tail_cov = torch.zeros(cov_size.sum(), dtype=torch.float, device=device)
+        all_tail_cov[cum_cov_size[rank] - cov_size[rank]: cum_cov_size[rank]] = tail_cov
+        if world_size > 1:
+            dist.all_reduce(all_tail_cov, op=dist.ReduceOp.SUM)
+
+        if head_cov is not None:
+            all_head_cov = torch.zeros(cov_size.sum(), dtype=torch.float, device=device)
+            all_head_cov[cum_cov_size[rank] - cov_size[rank]: cum_cov_size[rank]] = head_cov
+            if world_size > 1:
+                dist.all_reduce(all_head_cov, op=dist.ReduceOp.SUM)
+
     if rank == 0:
         test_time = time.perf_counter() - test_start
         test_speed = len(test_triplets) / max(1e-5, test_time)
@@ -187,9 +228,18 @@ def test(cfg, model, test_data, filtered_data=None):
         stats = getattr(getattr(model, "module", model), "stats", {})
         sparsity_dense = stats.get("sparsity_vs_dense", stats.get("physical_sparsity", 0.0)) * 100
         sparsity_full = stats.get("sparsity_vs_full", 0.0) * 100
+        nodes_frac = stats.get("nodes_frac", [])
+        edges_frac = stats.get("edges_frac", [])
         logger.warning(line)
         logger.warning("Test efficiency: eval_time=%.2fs  speed=%.1f triplets/s  peak_mem=%.1f MB  sparsity_vs_dense=%.1f%%  sparsity_vs_full=%.1f%%" %
                        (test_time, test_speed, peak_mem, sparsity_dense, sparsity_full))
+        if nodes_frac:
+            nodes_str = ", ".join("L%d: %.1f%%" % (idx + 1, f * 100) for idx, f in enumerate(nodes_frac))
+            logger.warning("Test nodes kept per layer: %s" % nodes_str)
+        if edges_frac:
+            edges_str = ", ".join("L%d: %.1f%%" % (idx + 1, f * 100) for idx, f in enumerate(edges_frac))
+            logger.warning("Test edges kept per layer: %s" % edges_str)
+
         for metric in cfg.task.metric:
             if metric == "mr":
                 score = all_ranking.float().mean()
@@ -211,7 +261,16 @@ def test(cfg, model, test_data, filtered_data=None):
                     score = score.mean()
                 else:
                     score = (all_ranking <= threshold).float().mean()
+            elif metric == "tail_coverage":
+                score = all_tail_cov.mean() if all_tail_cov is not None else 1.0
             logger.warning("%s: %g" % (metric, score))
+
+        if all_tail_cov is not None and "tail_coverage" not in cfg.task.metric:
+            logger.warning("tail_coverage: %g" % all_tail_cov.mean())
+            if all_head_cov is not None:
+                logger.warning("head_coverage: %g" % all_head_cov.mean())
+                all_target_cov = torch.cat([all_tail_cov, all_head_cov])
+                logger.warning("target_coverage: %g" % all_target_cov.mean())
     mrr = (1 / all_ranking.float()).mean()
 
     return mrr
@@ -256,6 +315,26 @@ if __name__ == "__main__":
         logger.warning(
             "Fixed config: distance_decay=exponential(rate=0.5)  "
             "scorer=GELU/no-LayerNorm/no-Dropout")
+
+        # Parameter count breakdown
+        if hasattr(model, "parameter_breakdown"):
+            param_counts = model.parameter_breakdown()
+        else:
+            tot = sum(p.numel() for p in model.parameters())
+            param_counts = {"total": tot, "base": tot, "pruner": 0, "pruner_pct": 0.0}
+
+        total_params = param_counts["total"]
+        base_params = param_counts["base"]
+        pruner_params = param_counts["pruner"]
+        pruner_pct = param_counts["pruner_pct"]
+
+        logger.warning(
+            "Parameter Breakdown: total=%d (%.2fK) | base_gnn=%d (%.2fK) | pruner=%d (%.2fK, %.2f%%)" %
+            (total_params, total_params / 1e3, base_params, base_params / 1e3,
+             pruner_params, pruner_params / 1e3, pruner_pct))
+        logger.warning(
+            "The pruner adds only %.2f thousand parameters (%.2f%% of total model size)." %
+            (pruner_params / 1e3, pruner_pct))
 
     device = util.get_device(cfg)
     model = model.to(device)

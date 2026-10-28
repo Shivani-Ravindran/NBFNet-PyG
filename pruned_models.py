@@ -197,11 +197,37 @@ class PrunedNBFNet(NBFNet):
         self._csr_cache = None
         self.reset_stats()
 
-    # ---------------------------------------------------------------- stats (no per-layer GPU syncs)
+    # ---------------------------------------------------------------- cost & stats
+    def parameter_breakdown(self):
+        """Count total parameters, base GNN parameters, and pruner parameters."""
+        total = sum(p.numel() for p in self.parameters())
+        pruner = 0
+        if self.scorer is not None:
+            pruner += sum(p.numel() for p in self.scorer.parameters())
+        if hasattr(self, "astar_mlp") and self.astar_mlp is not None:
+            pruner += sum(p.numel() for p in self.astar_mlp.parameters())
+        if hasattr(self, "astar_query_proj") and self.astar_query_proj is not None:
+            pruner += sum(p.numel() for p in self.astar_query_proj.parameters())
+        base = total - pruner
+        pruner_pct = (pruner / total * 100.0) if total > 0 else 0.0
+        return {
+            "total": total,
+            "base": base,
+            "pruner": pruner,
+            "pruner_pct": pruner_pct,
+        }
+
     def reset_stats(self):
         self._acc_active = 0            # python int: messages actually computed
         self._acc_full = 0.0            # tensor/float: messages sparse-"full" would compute
         self._acc_possible = 0          # B*E*L (dense upper bound)
+        num_layers = len(self.layers) if hasattr(self, "layers") else 0
+        self._layer_nodes_kept = [0] * num_layers
+        self._layer_edges_kept = [0] * num_layers
+        self._layer_nodes_total = 0     # sum of B * V across batches
+        self._layer_edges_total = 0     # sum of B * E across batches
+        self._last_nodes_frac = []
+        self._last_edges_frac = []
 
     def efficiency_stats(self):
         """Call only at log time (does one sync)."""
@@ -218,9 +244,19 @@ class PrunedNBFNet(NBFNet):
     @property
     def stats(self):
         eff = self.efficiency_stats()
+        nodes_frac = (
+            [k / max(1, self._layer_nodes_total) for k in self._layer_nodes_kept]
+            if getattr(self, "_layer_nodes_total", 0) > 0 else list(getattr(self, "_last_nodes_frac", []))
+        )
+        edges_frac = (
+            [k / max(1, self._layer_edges_total) for k in self._layer_edges_kept]
+            if getattr(self, "_layer_edges_total", 0) > 0 else list(getattr(self, "_last_edges_frac", []))
+        )
         return {
             **eff,
             "physical_sparsity": eff["sparsity_vs_dense"],
+            "nodes_frac": nodes_frac,
+            "edges_frac": edges_frac,
         }
 
     # ---------------------------------------------------------------- CSR (cached in eval)
@@ -301,7 +337,7 @@ class PrunedNBFNet(NBFNet):
                 s_u = self._astar_score(h_flat[uk], query[uk // V])
             keep = segment_topm(b_idx, s_u[inv], B, M)
             b_idx, e_idx = b_idx[keep], e_idx[keep]
-        return sel, b_idx, e_idx
+        return sel, b_idx, e_idx, len(b_n)
 
     # ---------------------------------------------------------------- core
     def bellmanford(self, data, h_index, r_index, separate_grad=False):
@@ -326,9 +362,10 @@ class PrunedNBFNet(NBFNet):
             raw_dist = self._dist_to_target(data.edge_index, V, self._t_pos, len(self.layers))
             dist_target = _compute_distance_target(raw_dist)      # (B*V,)
 
-        aux, full_equiv, nodes_frac, active = [], [], [], 0
+        aux, full_equiv, active = [], [], 0
+        current_nodes_frac, current_edges_frac = [], []
         h, hiddens = boundary, []
-        for layer in self.layers:
+        for l_idx, layer in enumerate(self.layers):
             h_flat = h.reshape(B * V, d)
             full_equiv.append((reached.float() * outdeg).sum())   # what sparse-full would send this layer
             node_gate = None
@@ -337,12 +374,14 @@ class PrunedNBFNet(NBFNet):
                 sel = reached
                 b_n, n_n = sel.nonzero(as_tuple=True)
                 b_idx, e_idx = expand_edges(b_n, n_n, rowptr, perm)
+                num_nodes_l = len(b_n)
 
             elif self.selector == "random":
                 score = torch.rand(B, V, device=dev)              # no scorer at all
                 sel = select_nodes(score, reached, outdeg, self.rho * E, True)
                 b_n, n_n = sel.nonzero(as_tuple=True)
                 b_idx, e_idx = expand_edges(b_n, n_n, rowptr, perm)
+                num_nodes_l = len(b_n)
 
             elif self.selector == "learned":
                 ridx = reached.reshape(-1).nonzero(as_tuple=True)[0]
@@ -352,6 +391,7 @@ class PrunedNBFNet(NBFNet):
                 node_gate = torch.sigmoid(s_full)
                 b_n, n_n = sel.nonzero(as_tuple=True)
                 b_idx, e_idx = expand_edges(b_n, n_n, rowptr, perm)
+                num_nodes_l = len(b_n)
                 if use_aux:
                     aux.append(F.binary_cross_entropy_with_logits(s_r, dist_target[ridx]))
 
@@ -359,8 +399,8 @@ class PrunedNBFNet(NBFNet):
                 ridx = reached.reshape(-1).nonzero(as_tuple=True)[0]
                 s_r = self._astar_score(h_flat[ridx], query[ridx // V])
                 s_full = self._scatter(s_r, ridx, B * V)
-                sel, b_idx, e_idx = self._select_astar(h_flat, query, reached, ridx, s_full,
-                                                       src, dst, rowptr, perm, E, B, V)
+                sel, b_idx, e_idx, num_nodes_l = self._select_astar(h_flat, query, reached, ridx, s_full,
+                                                                    src, dst, rowptr, perm, E, B, V)
                 node_gate = torch.sigmoid(s_full)
                 if use_aux:
                     aux.append(F.binary_cross_entropy_with_logits(s_r, dist_target[ridx]))
@@ -368,8 +408,13 @@ class PrunedNBFNet(NBFNet):
             h, recv = layer(h, query, boundary, data.edge_index, data.edge_type, node_gate, b_idx, e_idx)
             reached = reached | recv
             hiddens.append(h)
-            active += b_idx.numel()                               # shape only: no sync
-            nodes_frac.append(sel.float().sum() / (B * V))
+            num_edges_l = b_idx.numel()
+            active += num_edges_l
+            current_nodes_frac.append(num_nodes_l / max(1, B * V))
+            current_edges_frac.append(num_edges_l / max(1, B * E))
+            if hasattr(self, "_layer_nodes_kept") and l_idx < len(self._layer_nodes_kept):
+                self._layer_nodes_kept[l_idx] += num_nodes_l
+                self._layer_edges_kept[l_idx] += num_edges_l
 
         self.aux_loss = ((torch.stack(aux).mean() * self.aux_weight)
                          if (aux and self.aux_weight > 0) else torch.zeros((), device=dev))
@@ -377,6 +422,10 @@ class PrunedNBFNet(NBFNet):
         self._acc_active += active
         self._acc_full = self._acc_full + torch.stack(full_equiv).sum().detach()
         self._acc_possible += B * E * len(self.layers)
+        self._layer_nodes_total += B * V
+        self._layer_edges_total += B * E
+        self._last_nodes_frac = current_nodes_frac
+        self._last_edges_frac = current_edges_frac
 
         node_query = query.unsqueeze(1).expand(-1, V, -1)
         out = torch.cat((hiddens if self.concat_hidden else hiddens[-1:]) + [node_query], dim=-1)
