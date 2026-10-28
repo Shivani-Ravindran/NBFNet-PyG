@@ -63,9 +63,13 @@ def parse_args():
                         help="message budget fraction (default: 0.5)")
     parser.add_argument("--explore", type=float, default=0.2,
                         help="exploration fraction for learned selector (default: 0.2)")
+    parser.add_argument("--sparse_exec", type=str, default="true",
+                        choices=["true", "false"],
+                        help="enable physical sparse message execution (default: true)")
 
     args, unparsed = parser.parse_known_args()
     args.modified_loss = args.modified_loss == "true"
+    args.sparse_exec = args.sparse_exec == "true"
     # get dynamic arguments defined in the config file
     vars = detect_variables(args.config)
     parser = argparse.ArgumentParser()

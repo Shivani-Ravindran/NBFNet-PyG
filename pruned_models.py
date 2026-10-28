@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -8,12 +7,19 @@ from nbfnet.models import NBFNet
 SCORER_SELECTORS = {"learned", "astar"}
 
 
-class MaskedConv(nn.Module):
-    """Distmult + sum NBFNet layer with a per-query edge gate (B, E)."""
+# ─────────────────────────────────────────────────────────────────
+# Layer: sparse (physical) or dense (reference) execution
+# Both take the SAME inputs: selected (query, edge) pairs b_idx / e_idx
+# and a flat (B*V,) per-node gate (or None). Both return (new_h, recv(B,V)).
+# ─────────────────────────────────────────────────────────────────
+class SparsePrunedConv(nn.Module):
+    """Distmult + sum NBFNet layer with physical sparse execution."""
 
-    def __init__(self, in_dim, out_dim, num_relation, query_dim, layer_norm=False, dependent=True):
+    def __init__(self, in_dim, out_dim, num_relation, query_dim, layer_norm=False,
+                 dependent=True, sparse_exec=True, short_cut=False):
         super().__init__()
         self.num_relation, self.dependent = num_relation, dependent
+        self.sparse_exec, self.short_cut = sparse_exec, short_cut
         self.linear = nn.Linear(in_dim * 2, out_dim)
         self.norm = nn.LayerNorm(out_dim) if layer_norm else None
         if dependent:
@@ -21,21 +27,70 @@ class MaskedConv(nn.Module):
         else:
             self.relation = nn.Embedding(num_relation, in_dim)
 
-    def forward(self, h, query, boundary, edge_index, edge_type, gate):
-        B, V, d = h.shape
-        src, dst = edge_index
+    def _relations(self, query, B, d):
         if self.dependent:
-            rel = self.relation_linear(query).view(B, self.num_relation, d)
-        else:
-            rel = self.relation.weight.unsqueeze(0).expand(B, -1, -1)
-        msg = h[:, src] * rel[:, edge_type] * gate.unsqueeze(-1)          # (B, E, d)
-        agg = torch.zeros_like(h).index_add(1, dst, msg) + boundary       # sum + boundary
-        out = self.linear(torch.cat([h, agg], dim=-1))
+            return self.relation_linear(query).view(B, self.num_relation, d)
+        return self.relation.weight.unsqueeze(0).expand(B, -1, -1)
+
+    def _post(self, out):
         if self.norm is not None:
             out = self.norm(out)
         return F.relu(out)
 
+    def forward(self, h, query, boundary, edge_index, edge_type, node_gate, b_idx, e_idx):
+        if self.sparse_exec:
+            return self._forward_sparse(h, query, boundary, edge_index, edge_type, node_gate, b_idx, e_idx)
+        return self._forward_dense(h, query, boundary, edge_index, edge_type, node_gate, b_idx, e_idx)
 
+    def _forward_sparse(self, h, query, boundary, edge_index, edge_type, node_gate, b_idx, e_idx):
+        B, V, d = h.shape
+        src, dst = edge_index
+        recv = torch.zeros(B * V, dtype=torch.bool, device=h.device)
+        if b_idx.numel() == 0:
+            return h, recv.view(B, V)
+
+        rel = self._relations(query, B, d)
+        s_, t_, r_ = src[e_idx], dst[e_idx], edge_type[e_idx]
+        h_flat = h.reshape(B * V, d)
+        src_key = b_idx * V + s_
+        msg = h_flat[src_key] * rel[b_idx, r_]                         # (K, d)
+        if node_gate is not None:
+            msg = msg * node_gate[src_key].unsqueeze(-1)
+
+        uniq, inv = torch.unique(b_idx * V + t_, return_inverse=True)  # receiving (query, node) pairs
+        agg = h.new_zeros(len(uniq), d).index_add(0, inv, msg) + boundary.reshape(B * V, d)[uniq]
+        out = self._post(self.linear(torch.cat([h_flat[uniq], agg], dim=-1)))   # linear ONLY on receivers
+        if self.short_cut:
+            out = out + h_flat[uniq]
+        recv[uniq] = True
+        new_h = h_flat.index_copy(0, uniq, out).view(B, V, d)
+        return new_h, recv.view(B, V)
+
+    def _forward_dense(self, h, query, boundary, edge_index, edge_type, node_gate, b_idx, e_idx):
+        """Reference path (original masked behaviour). Used for equivalence tests / dense baseline."""
+        B, V, d = h.shape
+        src, dst = edge_index
+        esel = torch.zeros(B, src.numel(), dtype=torch.bool, device=h.device)
+        esel[b_idx, e_idx] = True
+        gate = esel.float()
+        if node_gate is not None:
+            gate = gate * node_gate.view(B, V)[:, src]
+        rel = self._relations(query, B, d)
+        msg = h[:, src] * rel[:, edge_type] * gate.unsqueeze(-1)
+        agg = torch.zeros_like(h).index_add(1, dst, msg) + boundary
+        out = self._post(self.linear(torch.cat([h, agg], dim=-1)))
+        if self.short_cut:
+            out = out + h
+        recv = torch.zeros(B, V, device=h.device).index_add(1, dst, esel.float()) > 0
+        return torch.where(recv.unsqueeze(-1), out, h), recv
+
+
+MaskedConv = SparsePrunedConv  # Backward-compatible alias
+
+
+# ─────────────────────────────────────────────────────────────────
+# Selection / graph helpers (all cost ~ selected set, not B*E)
+# ─────────────────────────────────────────────────────────────────
 def select_nodes(score, cand, outdeg, budget, force_first):
     """Top nodes by score until cumulative out-degree exceeds budget. Returns bool (B, V)."""
     s = score.masked_fill(~cand, float("-inf"))
@@ -48,57 +103,54 @@ def select_nodes(score, cand, outdeg, budget, force_first):
     return torch.zeros_like(cand).scatter(1, order, keep)
 
 
+def build_csr(index, V):
+    """CSR over `index` (src for out-edges, dst for in-edges). Returns rowptr (V+1), perm (E), deg (V)."""
+    perm = torch.argsort(index, stable=True)
+    deg = torch.bincount(index, minlength=V)
+    rowptr = F.pad(deg.cumsum(0), (1, 0))
+    return rowptr, perm, deg
+
+
+def expand_edges(b_idx, n_idx, rowptr, perm):
+    """For selected (query b, node n) pairs, list all their CSR edges WITHOUT a (B, E) tensor.
+    Returns (b_idx_edges, edge_ids)."""
+    deg = rowptr[n_idx + 1] - rowptr[n_idx]
+    rep = torch.repeat_interleave(torch.arange(len(deg), device=deg.device), deg)
+    start = deg.cumsum(0) - deg
+    off = torch.arange(len(rep), device=deg.device) - start[rep]
+    e = perm[rowptr[n_idx][rep] + off]
+    return b_idx[rep], e
+
+
+def segment_topm(b, score, B, M):
+    """Per-query top-M among expanded edges. Returns indices into b/score."""
+    o1 = score.argsort(descending=True)
+    o2 = b[o1].argsort(stable=True)
+    order = o1[o2]                                    # sorted by query, then by score desc
+    bs = b[order]
+    counts = torch.bincount(b, minlength=B)
+    starts = counts.cumsum(0) - counts
+    rank = torch.arange(len(b), device=b.device) - starts[bs]
+    return order[rank < M]
+
+
 # ─────────────────────────────────────────────────────────────────
 # Distance decay target helper – exponential, rate=0.5 (FIXED)
 # ─────────────────────────────────────────────────────────────────
-
 _DECAY_RATE = 0.5   # y = exp(-0.5 * d), proven best config
 
 
 def _compute_distance_target(dist):
-    """
-    Convert integer BFS distances to soft supervision targets in [0, 1].
-
-    Formula (fixed): y = exp(-0.5 * d)
-        - Exponential decay with rate 0.5 gives sharp, local supervision.
-        - Unreachable nodes (dist == inf) are mapped to 0.
-
-    Args:
-        dist : (B, V) float tensor of BFS distances from the target entity
-
-    Returns:
-        y    : (B, V) float tensor of target values in [0, 1]
-    """
+    """y = exp(-0.5 * d); unreachable (inf) -> 0."""
     y = torch.exp(-_DECAY_RATE * dist)
-    y = y.masked_fill(torch.isinf(dist), 0.0)
-    return y
+    return y.masked_fill(torch.isinf(dist), 0.0)
 
 
 # ─────────────────────────────────────────────────────────────────
 # MLP builder – GELU, no LayerNorm, no Dropout (fixed best config)
 # ─────────────────────────────────────────────────────────────────
 def _build_mlp(in_dim, hidden_dim, out_dim, depth):
-    """
-    Build a scorer MLP with GELU activation, no LayerNorm, no Dropout.
-
-    Experimental findings (scorer_comparison.docx):
-        - GELU is the best activation (Val MRR 0.3609, Test MRR 0.3160).
-        - LayerNorm degrades test MRR (0.2507 vs 0.2837 baseline).
-        - Dropout 0.1 causes over-regularisation (Test MRR 0.2632).
-      => Structural regularisation suppresses fine-grained distance signals.
-
-    Architecture per hidden layer:
-        Linear -> GELU
-
-    Final layer:
-        Linear(hidden_dim, out_dim)
-
-    Args:
-        in_dim     : input feature size
-        hidden_dim : width of every hidden layer
-        out_dim    : output size (usually 1 for scoring)
-        depth      : number of hidden layers (1 or 2)
-    """
+    """Scorer MLP: [Linear -> GELU] * depth, then Linear(hidden, out). depth in {1, 2}."""
     if depth not in (1, 2):
         raise ValueError("scorer_depth must be 1 or 2, got %s" % depth)
 
@@ -114,167 +166,217 @@ def _build_mlp(in_dim, hidden_dim, out_dim, depth):
 
 class PrunedNBFNet(NBFNet):
     def __init__(self, selector="learned", rho=0.5, explore=0.2, aux_weight=0.5,
-                 modified_loss=False, scorer_dim=64, scorer_depth=2, **kwargs):
+                 modified_loss=False, scorer_dim=64, scorer_depth=2, sparse_exec=True, **kwargs):
         super().__init__(**kwargs)
         assert selector in ("full", "random", "learned", "astar")
         if modified_loss and selector not in SCORER_SELECTORS:
             raise ValueError(
                 "modified_loss=True requires selector in %s, got '%s'" % (SCORER_SELECTORS, selector))
         assert kwargs.get("message_func", "distmult") == "distmult"
-        assert kwargs.get("aggregate_func", "sum") == "sum"
         assert len(set(self.dims)) == 1, "all hidden dims must equal input_dim"
         self.selector, self.rho, self.explore = selector, rho, explore
         self.aux_weight, self.modified_loss = aux_weight, modified_loss
         self.scorer_dim, self.scorer_depth = scorer_dim, scorer_depth
+        self.sparse_exec = sparse_exec
         d = self.dims[0]
         self.layers = nn.ModuleList(
-            MaskedConv(self.dims[i], self.dims[i + 1], kwargs["num_relation"], d,
-                       kwargs.get("layer_norm", False), kwargs.get("dependent", True))
+            SparsePrunedConv(self.dims[i], self.dims[i + 1], self.num_relation, d,
+                       kwargs.get("layer_norm", False), kwargs.get("dependent", True),
+                       sparse_exec=sparse_exec, short_cut=self.short_cut)
             for i in range(len(self.dims) - 1)
         )
-        # ── Scorer MLPs (GELU, no LayerNorm, no Dropout) ────────────
         # "learned" scorer (shared across layers): input = [h || query]
-        self.scorer = _build_mlp(2 * d, scorer_dim, 1, scorer_depth)
+        # only built when used, so random/full baselines carry no scorer params
+        self.scorer = _build_mlp(2 * d, scorer_dim, 1, scorer_depth) if selector == "learned" else None
         # "astar" scorer (A*Net-style, separate parameters)
-        self.astar_query_proj = nn.Linear(2 * d, d)
-        self.astar_mlp = _build_mlp(d, scorer_dim, 1, scorer_depth)
+        if selector == "astar":
+            self.astar_query_proj = nn.Linear(2 * d, d)
+            self.astar_mlp = _build_mlp(d, scorer_dim, 1, scorer_depth)
         self.aux_loss = torch.zeros(())
-        self.stats, self.last_reached, self._t_pos = {}, None, None
+        self.last_reached, self._t_pos = None, None
+        self._csr_cache = None
+        self.reset_stats()
 
-    # ---------------------------------------------------------------- helpers
+    # ---------------------------------------------------------------- stats (no per-layer GPU syncs)
+    def reset_stats(self):
+        self._acc_active = 0            # python int: messages actually computed
+        self._acc_full = 0.0            # tensor/float: messages sparse-"full" would compute
+        self._acc_possible = 0          # B*E*L (dense upper bound)
+
+    def efficiency_stats(self):
+        """Call only at log time (does one sync)."""
+        full = float(self._acc_full)
+        act = float(self._acc_active)
+        return {
+            "active_messages": act,
+            "full_equiv_messages": full,
+            "possible_messages": float(self._acc_possible),
+            "sparsity_vs_full": 1.0 - act / max(1.0, full),          # what pruning itself saves
+            "sparsity_vs_dense": 1.0 - act / max(1.0, float(self._acc_possible)),
+        }
+
+    @property
+    def stats(self):
+        eff = self.efficiency_stats()
+        return {
+            **eff,
+            "physical_sparsity": eff["sparsity_vs_dense"],
+        }
+
+    # ---------------------------------------------------------------- CSR (cached in eval)
+    def _out_csr(self, edge_index, V):
+        src = edge_index[0]
+        if not self.training:
+            key = (src.data_ptr(), src.numel(), V)
+            if self._csr_cache is not None and self._csr_cache[0] == key:
+                return self._csr_cache[1]
+            csr = build_csr(src, V)
+            self._csr_cache = (key, csr)
+            return csr
+        return build_csr(src, V)
+
+    # ---------------------------------------------------------------- aux target: sparse reverse BFS
     @staticmethod
     def _dist_to_target(edge_index, V, t_pos, hops):
+        """Hop distance to target for every (query, node); returns flat (B*V,) float, inf if > hops."""
         src, dst = edge_index
         B, dev = len(t_pos), t_pos.device
-        ar = torch.arange(B, device=dev)
-        dist = torch.full((B, V), float("inf"), device=dev)
-        frontier = torch.zeros(B, V, dtype=torch.bool, device=dev)
-        dist[ar, t_pos] = 0
-        frontier[ar, t_pos] = True
-        seen = frontier.clone()
+        rowptr, perm, _ = build_csr(dst, V)                      # incoming edges per node
+        dist = torch.full((B * V,), float("inf"), device=dev)
+        seen = torch.zeros(B * V, dtype=torch.bool, device=dev)
+        fb = torch.arange(B, device=dev)
+        fn = t_pos
+        key0 = fb * V + fn
+        dist[key0] = 0
+        seen[key0] = True
         for k in range(1, hops + 1):
-            nxt = torch.zeros(B, V, device=dev).index_add(1, src, frontier[:, dst].float()) > 0
-            nxt &= ~seen
-            dist[nxt] = k
-            seen |= nxt
-            frontier = nxt
+            if fb.numel() == 0:
+                break
+            b, e = expand_edges(fb, fn, rowptr, perm)
+            key = b * V + src[e]
+            key = key[~seen[key]]
+            key = torch.unique(key)
+            seen[key] = True
+            dist[key] = k
+            fb, fn = key // V, key % V
         return dist
 
-    def _select(self, h, query, reached, outdeg, E):
-        B, V, _ = h.shape
-        s = self.scorer(torch.cat([h, query.unsqueeze(1).expand(-1, V, -1)], dim=-1)).squeeze(-1)
+    # ---------------------------------------------------------------- scorers (reached nodes only)
+    def _astar_score(self, h_nodes, q_nodes):
+        proj = self.astar_query_proj(torch.cat([h_nodes, q_nodes], dim=-1))
+        return self.astar_mlp(h_nodes * proj).squeeze(-1)
+
+    @staticmethod
+    def _scatter(s_r, ridx, BV):
+        return s_r.new_zeros(BV).index_copy(0, ridx, s_r)       # differentiable wrt s_r
+
+    # ---------------------------------------------------------------- selectors
+    def _select_nodes_budget(self, score, reached, outdeg, E):
+        """Budgeted node selection used by learned / random."""
+        B, V = reached.shape
         budget = self.rho * E
-        if self.selector == "learned":
-            score = s.detach()
-        elif self.selector == "random":
-            score = torch.rand(B, V, device=h.device)
-        else:
-            score = torch.rand(B, V, device=h.device)
         explore = self.training and self.selector == "learned" and self.explore > 0
         main_budget = budget * (1 - self.explore) if explore else budget
         sel = select_nodes(score, reached, outdeg, main_budget, True)
         if explore:
             rest = reached & ~sel
-            sel = sel | select_nodes(torch.rand(B, V, device=h.device), rest, outdeg,
+            sel = sel | select_nodes(torch.rand(B, V, device=score.device), rest, outdeg,
                                      budget * self.explore, False)
-        gate = torch.sigmoid(s) if self.selector == "learned" else torch.ones_like(s)
-        return sel, gate, s
+        return sel
 
-    def _select_astar(self, h, query, reached, outdeg, src, dst, E, V):
-        """A*Net-style selection: node scoring, top-K nodes among reached, top-M edges by dst score."""
-        B = h.shape[0]
-        d = h.shape[2]
-        q_exp = query.unsqueeze(1).expand(-1, V, -1)             # (B, V, d)
-        proj = self.astar_query_proj(torch.cat([h, q_exp], dim=-1))  # (B, V, d)
-        distmult_msg = h * proj                                       # (B, V, d)
-        s = self.astar_mlp(distmult_msg).squeeze(-1)                  # (B, V)
-
-        score_det = s.detach()
-        K = max(1, int(self.rho * V))
+    def _select_astar(self, h_flat, query, reached, ridx, s_full, src, dst, rowptr, perm, E, B, V):
+        """A*Net-style: top-K reached nodes, then per-query top-M edges ranked by destination score.
+        Destination scores are computed only for candidate destinations (not all V nodes)."""
+        K = min(V, max(1, int(self.rho * V)))
         M = max(1, int(self.rho * E))
+        node_score = s_full.detach().view(B, V).masked_fill(~reached, float("-inf"))
+        _, topk_idx = node_score.topk(K, dim=1)
+        sel = torch.zeros(B, V, dtype=torch.bool, device=h_flat.device).scatter_(1, topk_idx, True) & reached
 
-        # --- node selection: top-K among reached nodes ---
-        node_score = score_det.masked_fill(~reached, float("-inf"))
-        n_reached = reached.sum(dim=1)                                # (B,)
-        actual_k = min(K, int(n_reached.max().item()))
-        if actual_k < V:
-            _, topk_idx = node_score.topk(actual_k, dim=1)
-            sel = torch.zeros(B, V, dtype=torch.bool, device=h.device)
-            sel.scatter_(1, topk_idx, True)
-            sel &= reached  # safety: mask out unreached that slipped in via padding
-        else:
-            sel = reached.clone()
-
-        # --- edge selection: among edges from kept nodes, keep top-M by dst score ---
-        src_kept = sel[:, src]                                        # (B, E)
-        dst_score = score_det[:, dst]                                 # (B, E)
-        edge_score = dst_score.masked_fill(~src_kept, float("-inf"))
-        n_cand = src_kept.sum(dim=1)                                  # (B,)
-        actual_m = min(M, int(n_cand.max().item()))
-        if actual_m < E:
-            _, edge_topk = edge_score.topk(actual_m, dim=1)
-            esel = torch.zeros(B, E, dtype=torch.bool, device=h.device)
-            esel.scatter_(1, edge_topk, True)
-            esel &= src_kept  # safety
-        else:
-            esel = src_kept.clone()
-
-        gate = esel.float() * torch.sigmoid(s)[:, src]
-        return sel, gate, esel, s
+        b_n, n_n = sel.nonzero(as_tuple=True)
+        b_idx, e_idx = expand_edges(b_n, n_n, rowptr, perm)
+        if b_idx.numel() > 0:
+            uk, inv = torch.unique(b_idx * V + dst[e_idx], return_inverse=True)
+            with torch.no_grad():
+                s_u = self._astar_score(h_flat[uk], query[uk // V])
+            keep = segment_topm(b_idx, s_u[inv], B, M)
+            b_idx, e_idx = b_idx[keep], e_idx[keep]
+        return sel, b_idx, e_idx
 
     # ---------------------------------------------------------------- core
     def bellmanford(self, data, h_index, r_index, separate_grad=False):
         B, V, dev = len(r_index), data.num_nodes, h_index.device
         src, dst = data.edge_index
         E = src.numel()
+        d = self.dims[0]
         ar = torch.arange(B, device=dev)
         query = self.query(r_index)
-        boundary = torch.zeros(B, V, self.dims[0], device=dev)
+        boundary = torch.zeros(B, V, d, device=dev)
         boundary[ar, h_index] = query
         reached = torch.zeros(B, V, dtype=torch.bool, device=dev)
         reached[ar, h_index] = True
-        outdeg = torch.bincount(src, minlength=V).float()
+
+        rowptr, perm, deg = self._out_csr(data.edge_index, V)
+        outdeg = deg.float()
 
         use_aux = (self.training and self.modified_loss
                    and self.selector in SCORER_SELECTORS and self._t_pos is not None)
-
-        # ── Distance decay targets: exp(-0.5 * d), computed once per pass ──
+        dist_target = None
         if use_aux:
             raw_dist = self._dist_to_target(data.edge_index, V, self._t_pos, len(self.layers))
-            dist_target = _compute_distance_target(raw_dist)
-        else:
-            dist_target = None
-        aux, edges_frac, nodes_frac = [], [], []
+            dist_target = _compute_distance_target(raw_dist)      # (B*V,)
 
+        aux, full_equiv, nodes_frac, active = [], [], [], 0
         h, hiddens = boundary, []
         for layer in self.layers:
+            h_flat = h.reshape(B * V, d)
+            full_equiv.append((reached.float() * outdeg).sum())   # what sparse-full would send this layer
+            node_gate = None
+
             if self.selector == "full":
-                sel, node_gate = reached, torch.ones(B, V, device=dev)
-                esel = sel[:, src]
-                gate = esel.float() * node_gate[:, src]
-            elif self.selector == "astar":
-                sel, gate, esel, s = self._select_astar(h, query, reached, outdeg, src, dst, E, V)
+                sel = reached
+                b_n, n_n = sel.nonzero(as_tuple=True)
+                b_idx, e_idx = expand_edges(b_n, n_n, rowptr, perm)
+
+            elif self.selector == "random":
+                score = torch.rand(B, V, device=dev)              # no scorer at all
+                sel = select_nodes(score, reached, outdeg, self.rho * E, True)
+                b_n, n_n = sel.nonzero(as_tuple=True)
+                b_idx, e_idx = expand_edges(b_n, n_n, rowptr, perm)
+
+            elif self.selector == "learned":
+                ridx = reached.reshape(-1).nonzero(as_tuple=True)[0]
+                s_r = self.scorer(torch.cat([h_flat[ridx], query[ridx // V]], dim=-1)).squeeze(-1)
+                s_full = self._scatter(s_r, ridx, B * V)
+                sel = self._select_nodes_budget(s_full.detach().view(B, V), reached, outdeg, E)
+                node_gate = torch.sigmoid(s_full)
+                b_n, n_n = sel.nonzero(as_tuple=True)
+                b_idx, e_idx = expand_edges(b_n, n_n, rowptr, perm)
                 if use_aux:
-                    aux.append(F.binary_cross_entropy_with_logits(s[reached], dist_target[reached]))
-            else:
-                sel, node_gate, s = self._select(h, query, reached, outdeg, E)
+                    aux.append(F.binary_cross_entropy_with_logits(s_r, dist_target[ridx]))
+
+            else:  # astar
+                ridx = reached.reshape(-1).nonzero(as_tuple=True)[0]
+                s_r = self._astar_score(h_flat[ridx], query[ridx // V])
+                s_full = self._scatter(s_r, ridx, B * V)
+                sel, b_idx, e_idx = self._select_astar(h_flat, query, reached, ridx, s_full,
+                                                       src, dst, rowptr, perm, E, B, V)
+                node_gate = torch.sigmoid(s_full)
                 if use_aux:
-                    aux.append(F.binary_cross_entropy_with_logits(s[reached], dist_target[reached]))
-                esel = sel[:, src]
-                gate = esel.float() * node_gate[:, src]
-            recv = torch.zeros(B, V, device=dev).index_add(1, dst, esel.float()) > 0
-            new = layer(h, query, boundary, data.edge_index, data.edge_type, gate)
-            if self.short_cut and new.shape == h.shape:
-                new = new + h
-            h = torch.where(recv.unsqueeze(-1), new, h)                      # carry over otherwise
+                    aux.append(F.binary_cross_entropy_with_logits(s_r, dist_target[ridx]))
+
+            h, recv = layer(h, query, boundary, data.edge_index, data.edge_type, node_gate, b_idx, e_idx)
             reached = reached | recv
             hiddens.append(h)
-            edges_frac.append((sel.float() * outdeg).sum(1).mean().item() / E)
-            nodes_frac.append(sel.float().sum(1).mean().item() / V)
+            active += b_idx.numel()                               # shape only: no sync
+            nodes_frac.append(sel.float().sum() / (B * V))
 
-        self.aux_loss = (torch.stack(aux).mean() * self.aux_weight) if (aux and self.aux_weight > 0) else torch.zeros((), device=dev)
+        self.aux_loss = ((torch.stack(aux).mean() * self.aux_weight)
+                         if (aux and self.aux_weight > 0) else torch.zeros((), device=dev))
         self.last_reached = reached
-        self.stats = {"edges_frac": edges_frac, "nodes_frac": nodes_frac}
+        self._acc_active += active
+        self._acc_full = self._acc_full + torch.stack(full_equiv).sum().detach()
+        self._acc_possible += B * E * len(self.layers)
 
         node_query = query.unsqueeze(1).expand(-1, V, -1)
         out = torch.cat((hiddens if self.concat_hidden else hiddens[-1:]) + [node_query], dim=-1)
@@ -289,7 +391,7 @@ class PrunedNBFNet(NBFNet):
         assert (h_index[:, [0]] == h_index).all()
         assert (r_index[:, [0]] == r_index).all()
 
-        # column 0 is the positive target after negative_sample_to_tail for both head and tail queries
+        # column 0 is the positive target after negative_sample_to_tail
         self._t_pos = t_index[:, 0] if self.training else None
 
         output = self.bellmanford(data, h_index[:, 0], r_index[:, 0])

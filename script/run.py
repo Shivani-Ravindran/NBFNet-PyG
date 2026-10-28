@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import math
 import pprint
 
@@ -52,6 +53,12 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None):
                 logger.warning("Epoch %d begin" % epoch)
 
             losses = []
+            epoch_start = time.perf_counter()
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+            m = getattr(model, "module", model)
+            if hasattr(m, "reset_stats"):
+                m.reset_stats()
             sampler.set_epoch(epoch)
             for batch in train_loader:
                 batch = tasks.negative_sampling(train_data, batch, cfg.task.num_negative,
@@ -82,11 +89,19 @@ def train_and_validate(cfg, model, train_data, valid_data, filtered_data=None):
                 batch_id += 1
 
             if util.get_rank() == 0:
+                epoch_time = time.perf_counter() - epoch_start
                 avg_loss = sum(losses) / len(losses)
+                train_speed = len(train_triplets) / max(1e-5, epoch_time)
+                peak_mem = (torch.cuda.max_memory_allocated() / (1024 ** 2)) if torch.cuda.is_available() else 0.0
+                stats = getattr(getattr(model, "module", model), "stats", {})
+                sparsity_dense = stats.get("sparsity_vs_dense", stats.get("physical_sparsity", 0.0)) * 100
+                sparsity_full = stats.get("sparsity_vs_full", 0.0) * 100
                 logger.warning(separator)
                 logger.warning("Epoch %d end" % epoch)
                 logger.warning(line)
                 logger.warning("average binary cross entropy: %g" % avg_loss)
+                logger.warning("Epoch %d efficiency: time=%.2fs  speed=%.1f triplets/s  peak_mem=%.1f MB  sparsity_vs_dense=%.1f%%  sparsity_vs_full=%.1f%%" %
+                               (epoch, epoch_time, train_speed, peak_mem, sparsity_dense, sparsity_full))
 
         epoch = min(cfg.train.num_epoch, i + step)
         if rank == 0:
@@ -121,6 +136,13 @@ def test(cfg, model, test_data, filtered_data=None):
     test_triplets = torch.cat([test_data.target_edge_index, test_data.target_edge_type.unsqueeze(0)]).t()
     sampler = torch_data.DistributedSampler(test_triplets, world_size, rank)
     test_loader = torch_data.DataLoader(test_triplets, cfg.train.batch_size, sampler=sampler)
+
+    test_start = time.perf_counter()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    m = getattr(model, "module", model)
+    if hasattr(m, "reset_stats"):
+        m.reset_stats()
 
     model.eval()
     rankings = []
@@ -159,6 +181,15 @@ def test(cfg, model, test_data, filtered_data=None):
         dist.all_reduce(all_num_negative, op=dist.ReduceOp.SUM)
 
     if rank == 0:
+        test_time = time.perf_counter() - test_start
+        test_speed = len(test_triplets) / max(1e-5, test_time)
+        peak_mem = (torch.cuda.max_memory_allocated() / (1024 ** 2)) if torch.cuda.is_available() else 0.0
+        stats = getattr(getattr(model, "module", model), "stats", {})
+        sparsity_dense = stats.get("sparsity_vs_dense", stats.get("physical_sparsity", 0.0)) * 100
+        sparsity_full = stats.get("sparsity_vs_full", 0.0) * 100
+        logger.warning(line)
+        logger.warning("Test efficiency: eval_time=%.2fs  speed=%.1f triplets/s  peak_mem=%.1f MB  sparsity_vs_dense=%.1f%%  sparsity_vs_full=%.1f%%" %
+                       (test_time, test_speed, peak_mem, sparsity_dense, sparsity_full))
         for metric in cfg.task.metric:
             if metric == "mr":
                 score = all_ranking.float().mean()
@@ -204,6 +235,7 @@ if __name__ == "__main__":
     cfg.model.pop("class", None)
     scorer_dim = getattr(args, "scorer_dim", 64)
     scorer_depth = getattr(args, "scorer_depth", 2)
+    sparse_exec = getattr(args, "sparse_exec", True)
     model = PrunedNBFNet(
         selector=args.selector,
         rho=args.rho,
@@ -212,14 +244,15 @@ if __name__ == "__main__":
         modified_loss=args.modified_loss,
         scorer_dim=scorer_dim,
         scorer_depth=scorer_depth,
+        sparse_exec=sparse_exec,
         # decay=exp(-0.5*d), activation=GELU, layer_norm=OFF, dropout=OFF (all fixed)
         **cfg.model)
     if util.get_rank() == 0:
         logger.warning(
             "Pruning config: selector=%s  modified_loss=%s  aux_weight=%g  "
-            "rho=%g  explore=%g  scorer_dim=%d  scorer_depth=%d" %
+            "rho=%g  explore=%g  scorer_dim=%d  scorer_depth=%d  sparse_exec=%s" %
             (args.selector, args.modified_loss, args.aux_weight,
-             args.rho, args.explore, scorer_dim, scorer_depth))
+             args.rho, args.explore, scorer_dim, scorer_depth, sparse_exec))
         logger.warning(
             "Fixed config: distance_decay=exponential(rate=0.5)  "
             "scorer=GELU/no-LayerNorm/no-Dropout")
