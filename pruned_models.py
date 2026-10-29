@@ -57,13 +57,29 @@ class SparsePrunedConv(nn.Module):
         if node_gate is not None:
             msg = msg * node_gate[src_key].unsqueeze(-1)
 
-        uniq, inv = torch.unique(b_idx * V + t_, return_inverse=True)  # receiving (query, node) pairs
+        # Sort-free dedup: O(K + B*V), no sort on K keys every layer.
+        # mark[] scatter gives a sorted uniq (ascending), so downstream is unchanged.
+        key = b_idx * V + t_
+        mark = torch.zeros(B * V, dtype=torch.bool, device=h.device)
+        mark[key] = True
+        uniq = mark.nonzero(as_tuple=True)[0]
+        idmap = torch.empty(B * V, dtype=torch.long, device=h.device)
+        idmap[uniq] = torch.arange(len(uniq), device=h.device)
+        inv = idmap[key]
+
         agg = h.new_zeros(len(uniq), d).index_add(0, inv, msg) + boundary.reshape(B * V, d)[uniq]
         out = self._post(self.linear(torch.cat([h_flat[uniq], agg], dim=-1)))   # linear ONLY on receivers
         if self.short_cut:
             out = out + h_flat[uniq]
         recv[uniq] = True
-        new_h = h_flat.index_copy(0, uniq, out).view(B, V, d)
+        # In-place update at eval avoids cloning the full B*V*d state tensor.
+        # Out-of-place is kept during training so autograd works.
+        if not torch.is_grad_enabled():
+            h_flat = h_flat.clone()
+            h_flat.index_copy_(0, uniq, out)
+            new_h = h_flat.view(B, V, d)
+        else:
+            new_h = h_flat.index_copy(0, uniq, out).view(B, V, d)
         return new_h, recv.view(B, V)
 
     def _forward_dense(self, h, query, boundary, edge_index, edge_type, node_gate, b_idx, e_idx):
@@ -92,7 +108,19 @@ MaskedConv = SparsePrunedConv  # Backward-compatible alias
 # Selection / graph helpers (all cost ~ selected set, not B*E)
 # ─────────────────────────────────────────────────────────────────
 def select_nodes(score, cand, outdeg, budget, force_first):
-    """Top nodes by score until cumulative out-degree exceeds budget. Returns bool (B, V)."""
+    """Top nodes by score until cumulative out-degree exceeds budget. Returns bool (B, V).
+
+    Optimisation: if every query's total reachable out-degree already fits inside
+    the budget, selection can't prune anything, so we skip the O(V log V) argsort
+    and return the full candidate set immediately.
+    """
+    # Per-query total out-degree of reached (candidate) nodes.
+    # Shape: (B,).  If all rows fit the budget, no pruning is possible.
+    total_deg = (cand.float() * outdeg).sum(dim=1)   # (B,)
+    if (total_deg <= budget).all():
+        # Nothing to prune: return the full candidate set unchanged.
+        return cand
+
     s = score.masked_fill(~cand, float("-inf"))
     order = s.argsort(dim=1, descending=True)
     cand_sorted = cand.gather(1, order)
