@@ -118,8 +118,10 @@ def select_nodes(score, cand, outdeg, budget, force_first):
     # Shape: (B,).  If all rows fit the budget, no pruning is possible.
     total_deg = (cand.float() * outdeg).sum(dim=1)   # (B,)
     if (total_deg <= budget).all():
-        # Nothing to prune: return the full candidate set unchanged.
-        return cand
+        # Nothing to prune: return a fresh copy so that callers computing
+        # rest = cand & ~sel still get a non-aliased tensor -- important
+        # for the exploration branch in _select_nodes_budget during training.
+        return cand.clone()
 
     s = score.masked_fill(~cand, float("-inf"))
     order = s.argsort(dim=1, descending=True)
