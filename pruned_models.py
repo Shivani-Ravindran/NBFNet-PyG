@@ -225,6 +225,7 @@ class PrunedNBFNet(NBFNet):
         self.aux_loss = torch.zeros(())
         self.last_reached, self._t_pos = None, None
         self._csr_cache = None
+        self._in_csr_cache = None
         self.reset_stats()
 
     # ---------------------------------------------------------------- cost & stats
@@ -289,7 +290,7 @@ class PrunedNBFNet(NBFNet):
             "edges_frac": edges_frac,
         }
 
-    # ---------------------------------------------------------------- CSR (cached in eval)
+    # ---------------------------------------------------------------- CSR (cached in eval / reverse)
     def _out_csr(self, edge_index, V):
         src = edge_index[0]
         if not self.training:
@@ -301,13 +302,23 @@ class PrunedNBFNet(NBFNet):
             return csr
         return build_csr(src, V)
 
+    def _in_csr(self, dst, V):
+        key = (dst.data_ptr(), dst.numel(), V)
+        if self._in_csr_cache is not None and self._in_csr_cache[0] == key:
+            return self._in_csr_cache[1]
+        csr = build_csr(dst, V)
+        self._in_csr_cache = (key, csr)
+        return csr
+
     # ---------------------------------------------------------------- aux target: sparse reverse BFS
     @staticmethod
-    def _dist_to_target(edge_index, V, t_pos, hops):
+    def _dist_to_target(edge_index, V, t_pos, hops, rowptr_in=None, perm_in=None):
         """Hop distance to target for every (query, node); returns flat (B*V,) float, inf if > hops."""
         src, dst = edge_index
         B, dev = len(t_pos), t_pos.device
-        rowptr, perm, _ = build_csr(dst, V)                      # incoming edges per node
+        if rowptr_in is None or perm_in is None:
+            rowptr_in, perm_in, _ = build_csr(dst, V)                      # incoming edges per node
+        rowptr, perm = rowptr_in, perm_in
         dist = torch.full((B * V,), float("inf"), device=dev)
         seen = torch.zeros(B * V, dtype=torch.bool, device=dev)
         fb = torch.arange(B, device=dev)
@@ -321,7 +332,12 @@ class PrunedNBFNet(NBFNet):
             b, e = expand_edges(fb, fn, rowptr, perm)
             key = b * V + src[e]
             key = key[~seen[key]]
-            key = torch.unique(key)
+            if key.numel() == 0:
+                break
+            # Sort-free dedup using mark tensor avoids expensive torch.unique on GPU
+            mark = torch.zeros(B * V, dtype=torch.bool, device=dev)
+            mark[key] = True
+            key = mark.nonzero(as_tuple=True)[0]
             seen[key] = True
             dist[key] = k
             fb, fn = key // V, key % V
@@ -338,12 +354,17 @@ class PrunedNBFNet(NBFNet):
 
     # ---------------------------------------------------------------- selectors
     def _select_nodes_budget(self, score, reached, outdeg, E):
-        """Budgeted node selection used by learned / random."""
+        """Budgeted node selection used by learned / random.
+        Uses degree-aware priority density to prevent hub nodes from monopolizing the budget."""
         B, V = reached.shape
         budget = self.rho * E
         explore = self.training and self.selector == "learned" and self.explore > 0
         main_budget = budget * (1 - self.explore) if explore else budget
-        sel = select_nodes(score, reached, outdeg, main_budget, True)
+
+        # Degree-aware priority density: sigmoid(score) / sqrt(outdeg)
+        # Prevents 1 or 2 hub nodes from instantly consuming the entire edge budget.
+        prio = torch.sigmoid(score) / outdeg.clamp(min=1).pow(0.5)
+        sel = select_nodes(prio, reached, outdeg, main_budget, True)
         if explore:
             rest = reached & ~sel
             sel = sel | select_nodes(torch.rand(B, V, device=score.device), rest, outdeg,
@@ -351,8 +372,8 @@ class PrunedNBFNet(NBFNet):
         return sel
 
     def _select_astar(self, h_flat, query, reached, ridx, s_full, src, dst, rowptr, perm, E, B, V):
-        """A*Net-style: top-K reached nodes, then per-query top-M edges ranked by destination score.
-        Destination scores are computed only for candidate destinations (not all V nodes)."""
+        """A*Net-style: top-K reached nodes, then per-query top-M edges ranked by heuristic score.
+        Uses source node heuristic priority to avoid unreached destination zero-vector evaluation."""
         K = min(V, max(1, int(self.rho * V)))
         M = max(1, int(self.rho * E))
         node_score = s_full.detach().view(B, V).masked_fill(~reached, float("-inf"))
@@ -361,11 +382,11 @@ class PrunedNBFNet(NBFNet):
 
         b_n, n_n = sel.nonzero(as_tuple=True)
         b_idx, e_idx = expand_edges(b_n, n_n, rowptr, perm)
-        if b_idx.numel() > 0:
-            uk, inv = torch.unique(b_idx * V + dst[e_idx], return_inverse=True)
-            with torch.no_grad():
-                s_u = self._astar_score(h_flat[uk], query[uk // V])
-            keep = segment_topm(b_idx, s_u[inv], B, M)
+        # Only prune edges if they actually exceed the per-query budget M
+        if b_idx.numel() > M:
+            # Score each expanded edge by its source node's heuristic score
+            src_edge_score = s_full[b_idx * V + src[e_idx]]
+            keep = segment_topm(b_idx, src_edge_score, B, M)
             b_idx, e_idx = b_idx[keep], e_idx[keep]
         return sel, b_idx, e_idx, len(b_n)
 
@@ -389,7 +410,9 @@ class PrunedNBFNet(NBFNet):
                    and self.selector in SCORER_SELECTORS and self._t_pos is not None)
         dist_target = None
         if use_aux:
-            raw_dist = self._dist_to_target(data.edge_index, V, self._t_pos, len(self.layers))
+            rowptr_in, perm_in, _ = self._in_csr(dst, V)
+            raw_dist = self._dist_to_target(data.edge_index, V, self._t_pos, len(self.layers),
+                                            rowptr_in=rowptr_in, perm_in=perm_in)
             dist_target = _compute_distance_target(raw_dist)      # (B*V,)
 
         aux, full_equiv, active = [], [], 0
@@ -415,10 +438,14 @@ class PrunedNBFNet(NBFNet):
 
             elif self.selector == "learned":
                 ridx = reached.reshape(-1).nonzero(as_tuple=True)[0]
-                s_r = self.scorer(torch.cat([h_flat[ridx], query[ridx // V]], dim=-1)).squeeze(-1)
+                # Detach backbone representations when using aux loss to prevent gradient conflict
+                h_in = h_flat[ridx].detach() if self.modified_loss else h_flat[ridx]
+                q_in = query[ridx // V].detach() if self.modified_loss else query[ridx // V]
+                s_r = self.scorer(torch.cat([h_in, q_in], dim=-1)).squeeze(-1)
                 s_full = self._scatter(s_r, ridx, B * V)
                 sel = self._select_nodes_budget(s_full.detach().view(B, V), reached, outdeg, E)
-                node_gate = torch.sigmoid(s_full)
+                # When using distance aux loss, do not squash messages with negative logits
+                node_gate = None if self.modified_loss else torch.sigmoid(s_full)
                 b_n, n_n = sel.nonzero(as_tuple=True)
                 b_idx, e_idx = expand_edges(b_n, n_n, rowptr, perm)
                 num_nodes_l = len(b_n)
@@ -427,11 +454,13 @@ class PrunedNBFNet(NBFNet):
 
             else:  # astar
                 ridx = reached.reshape(-1).nonzero(as_tuple=True)[0]
-                s_r = self._astar_score(h_flat[ridx], query[ridx // V])
+                h_in = h_flat[ridx].detach() if self.modified_loss else h_flat[ridx]
+                q_in = query[ridx // V].detach() if self.modified_loss else query[ridx // V]
+                s_r = self._astar_score(h_in, q_in)
                 s_full = self._scatter(s_r, ridx, B * V)
                 sel, b_idx, e_idx, num_nodes_l = self._select_astar(h_flat, query, reached, ridx, s_full,
                                                                     src, dst, rowptr, perm, E, B, V)
-                node_gate = torch.sigmoid(s_full)
+                node_gate = None if self.modified_loss else torch.sigmoid(s_full)
                 if use_aux:
                     aux.append(F.binary_cross_entropy_with_logits(s_r, dist_target[ridx]))
 
