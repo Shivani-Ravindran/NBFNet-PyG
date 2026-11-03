@@ -4,7 +4,7 @@ from torch import nn
 
 from nbfnet.models import NBFNet
 
-SCORER_SELECTORS = {"learned", "astar"}
+SCORER_SELECTORS = {"learned", "astar", "full"}
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -217,7 +217,7 @@ class PrunedNBFNet(NBFNet):
         )
         # "learned" scorer (shared across layers): input = [h || query]
         # only built when used, so random/full baselines carry no scorer params
-        self.scorer = _build_mlp(2 * d, scorer_dim, 1, scorer_depth) if selector == "learned" else None
+        self.scorer = _build_mlp(2 * d, scorer_dim, 1, scorer_depth) if (selector == "learned" or (selector == "full" and modified_loss)) else None
         # "astar" scorer (A*Net-style, separate parameters)
         if selector == "astar":
             self.astar_query_proj = nn.Linear(2 * d, d)
@@ -428,6 +428,11 @@ class PrunedNBFNet(NBFNet):
                 b_n, n_n = sel.nonzero(as_tuple=True)
                 b_idx, e_idx = expand_edges(b_n, n_n, rowptr, perm)
                 num_nodes_l = len(b_n)
+                if use_aux and self.scorer is not None:
+                    ridx = reached.reshape(-1).nonzero(as_tuple=True)[0]
+                    # Backprop into backbone h_flat so distance loss guides GNN representation learning
+                    s_r = self.scorer(torch.cat([h_flat[ridx], query[ridx // V]], dim=-1)).squeeze(-1)
+                    aux.append(F.binary_cross_entropy_with_logits(s_r, dist_target[ridx]))
 
             elif self.selector == "random":
                 score = torch.rand(B, V, device=dev)              # no scorer at all
