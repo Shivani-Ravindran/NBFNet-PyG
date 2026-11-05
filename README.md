@@ -1,228 +1,195 @@
-# NBFNet: Neural Bellman-Ford Networks #
+# Budgeted Node Expansion for NBFNet
 
-PyG re-implementation of [NBFNet]. Authored by [Zhaocheng Zhu] and [Michael Galkin].
+Learned and A*-style pruning with a distance-aware auxiliary loss, for faster and lighter knowledge graph link prediction.
 
-[Zhaocheng Zhu]: https://kiddozhu.github.io
-[Michael Galkin]: https://migalkin.github.io/
-[NBFNet]: https://github.com/DeepGraphLearning/NBFNet
+Built on [NBFNet-PyG](https://github.com/KiddoZhu/NBFNet-PyG). A*Net ([AStarNet](https://github.com/DeepGraphLearning/AStarNet)) is used as a reference for the A*-style pruner. This is a Deep Learning semester project.
 
-## Overview ##
+---
 
-NBFNet is a graph neural network framework inspired by traditional path-based
-methods. It enjoys the advantages of both traditional path-based methods and modern
-graph neural networks, including **generalization in the inductive setting**,
-**interpretability**, **high model capacity** and **scalability**. This repo implements
-NBFNet for transductive and inductive knowledge graph reasoning.
+## 1. Motivation
 
-![NBFNet](asset/nbfnet.svg)
+NBFNet predicts a missing link `(head, relation, ?)` by running Bellman-Ford-style message passing from the head node over `L` layers. At every layer, **every reached node sends messages along all its edges**. On large graphs the number of active nodes and edges grows quickly, so time and memory become the bottleneck.
 
-This codebase is based on PyTorch and PyTorch-Geometric. It supports training and
-inference with multiple GPUs or multiple machines.
+A*Net showed that most of this work is unnecessary: only a small, well-chosen part of the graph needs to be expanded at each layer.
 
-## Installation ##
+**Research goal:** make NBFNet cheaper in **time and memory**, accepting a small loss in accuracy, and find out which pruning strategy gives the best accuracy per unit of compute.
 
-You may install the dependencies via either conda or pip. Generally, NBFNet works
-with Python >= 3.7 and PyTorch >= 1.8.0.
+## 2. Research questions
 
-### From Conda ###
+1. How much accuracy (MRR, Hits@k) do we lose when only a fraction `rho` of the graph is expanded per layer?
+2. Does a **learned MLP pruner** beat random pruning at the same budget?
+3. How does it compare with an **A*Net-style pruner**, the most efficient pruner so far?
+4. Does adding a **distance-to-target auxiliary loss** make the pruner keep more useful nodes, for either learned pruner?
+
+## 3. Method overview
+
+```
+NBFNet backbone (L Bellman-Ford layers)
+        |
+        v   at every layer, given node states h and query q
+Pruning selector  (full | random | learned | astar)
+        |
+        +--> Expansion budget: keep only a fraction rho of nodes / edges
+        |
+        +--> Message gating: multiply messages by sigmoid(s)   (learned, astar)
+        |
+        v
+Sparse message passing (distmult messages + sum aggregation)
+        |
+        v   only if training and modified_loss=true
+Auxiliary distance loss
+```
+
+### 3.1 Selectors
+
+| Selector | What it does | Trained scorer |
+|---|---|---|
+| `full` | Every reached node expands. This is NBFNet (with sum aggregation). | no |
+| `random` | Random node scores, same budget as the others. | no |
+| `learned` | MLP pruner. `s = MLP([h_u \|\| q])`, shared across layers. Keeps the top-scoring nodes until their out-edges reach the budget `rho * \|E\|`. During training a fraction `explore` of the budget goes to random nodes. | yes |
+| `astar` | A*Net-style pruner. `s = MLP(h_u * W[h_u \|\| q])`. Keeps the top `K = rho * \|V\|` reached nodes, then the top `M = rho * \|E\|` of their out-edges ranked by the **destination** node's score. | yes |
+
+Notes:
+
+- `rho` is the fraction of nodes and edges allowed to expand per layer. It is the same number for every selector, so all runs have the same per-layer edge budget.
+- Top-K selection has no gradient. For `learned` and `astar`, each kept node's messages are multiplied by `sigmoid(s)`. That is how the scorer receives gradient from the main loss, as in A*Net.
+- `random` and `full` have no scorer parameters.
+
+### 3.2 Modified loss (distance penalty)
+
+With `--modified_loss true`, the total training loss is
+
+```
+L = L_main + lambda * L_dist
+```
+
+- `L_main`: the usual NBFNet loss (binary cross-entropy with adversarial negative weighting).
+- `L_dist`: binary cross-entropy between the pruner's score `s` of each reached node and a distance target `y = exp(-0.5 * d)`, where `d` is the hop distance from that node to the true tail. Unreachable nodes get `y = 0`.
+- `lambda` is `--aux_weight`.
+
+The idea: the pruner should score nodes that are close to the answer higher, so the budget is spent on useful nodes. The distance is computed only at training time, when the target tail is known, using a reverse breadth-first search limited to `L` hops. At test time the pruner uses only its learned score.
+
+`modified_loss=true` is only valid for `learned` and `astar`, because `full` and `random` have no trained scorer. Other combinations raise an error.
+
+### 3.3 Variants evaluated
+
+| Run | selector | modified_loss |
+|---|---|---|
+| Baseline | `full` | - |
+| Random pruner | `random` | - |
+| MLP pruner | `learned` | false |
+| MLP pruner + distance loss | `learned` | true |
+| A*Net-style pruner | `astar` | false |
+| A*Net-style pruner + distance loss | `astar` | true |
+
+### 3.4 Sparse execution
+
+Early versions of the pruner only **masked** messages, so the full computation still ran and no time or memory was saved. The current implementation (`--sparse_exec true`, default) builds only the selected `(query, edge)` pairs, runs the layer's linear update only on receiving nodes, and uses CSR indexing to expand selected nodes without creating a `(batch, num_edges)` tensor. The old dense path is kept (`--sparse_exec false`) as a reference for equivalence tests.
+
+## 4. Metrics
+
+**Accuracy:** MRR, MR, Hits@1/3/10, and **tail coverage** (the share of test queries whose true tail is reached by the kept nodes; a low value means the pruner throws the answer away).
+
+**Efficiency (logged every epoch and at test time):**
+
+- time per epoch and per evaluation, throughput (triplets/s)
+- peak GPU memory
+- nodes kept and edges kept per layer (fraction of the full graph)
+- active messages vs a sparse `full` run (`sparsity_vs_full`) and vs the dense upper bound (`sparsity_vs_dense`)
+- parameter count, with the pruner's share reported separately
+
+**Trade-off:** MRR vs edges kept across several `rho` values, MRR retained relative to `full`, and speedup / memory reduction relative to `full`.
+
+## 5. Experimental protocol (equal budget)
+
+All variants run from this single codebase with the same:
+
+- dataset and split, hidden size, layers, learning rate, batch size, epochs
+- `rho`, seeds (2-3 seeds, report mean and std)
+- GPU type (use the same type for every timing run)
+
+Timing rules: warm-up pass first, `torch.cuda.synchronize()` before stopping timers, data loading excluded. Everything is config-driven and a checkpoint is saved periodically, so each run is launched once.
+
+## 6. Repository structure
+
+```
+nbfnet/            NBFNet model, layers, datasets, utilities (from NBFNet-PyG)
+pruned_models.py   PrunedNBFNet: selectors, sparse layer, auxiliary loss, efficiency stats
+script/run.py      Training and evaluation loop (with efficiency logging)
+config/            YAML configs (transductive / inductive)
+```
+
+## 7. Installation
 
 ```bash
-conda install pytorch=1.8.0 cudatoolkit=11.1 pyg -c pytorch -c pyg -c conda-forge
-conda install ninja easydict pyyaml -c conda-forge
+pip install torch torch-geometric easydict pyyaml
 ```
 
-### From Pip ###
+`torch-scatter` and `torch-sparse` are not needed: scatter operations come from `torch_geometric.utils`. Datasets (WN18RR, FB15k-237) are downloaded automatically by PyTorch Geometric.
+
+## 8. Usage
+
+`--gpus` fills the `{{ gpus }}` variable in the YAML config. Use `"[0]"` for the first GPU and `"[]"` for CPU.
 
 ```bash
-pip install torch==1.8.0+cu111 -f https://download.pytorch.org/whl/torch_stable.html
-pip install torch-scatter==2.0.8 torch-sparse==0.6.12 torch-geometric -f https://data.pyg.org/whl/torch-1.8.0+cu111.html
-pip install ninja easydict pyyaml
+# Baseline (plain NBFNet behaviour)
+python script/run.py -c config/transductive/wn18rr.yaml --gpus "[0]" --selector full
+
+# Random pruner
+python script/run.py -c config/transductive/wn18rr.yaml --gpus "[0]" --selector random --rho 0.5
+
+# MLP pruner
+python script/run.py -c config/transductive/wn18rr.yaml --gpus "[0]" --selector learned --modified_loss false
+
+# MLP pruner + distance loss
+python script/run.py -c config/transductive/wn18rr.yaml --gpus "[0]" --selector learned --modified_loss true
+
+# A*Net-style pruner (+ distance loss)
+python script/run.py -c config/transductive/wn18rr.yaml --gpus "[0]" --selector astar --modified_loss true
 ```
 
-## Reproduction ##
+In a Kaggle notebook, use `%cd` to enter the repo and put `!` in front of each command.
 
-To reproduce the results of NBFNet, use the following command. Alternatively, you
-may use `--gpus null` to run NBFNet on a CPU. All the datasets will be automatically
-downloaded in the code.
+| Argument | Default | Meaning |
+|---|---|---|
+| `--selector` | `learned` | `full`, `random`, `learned` or `astar` |
+| `--modified_loss` | `false` | add the distance loss (`learned` and `astar` only) |
+| `--aux_weight` | `0.5` | lambda for the distance loss |
+| `--rho` | `0.5` | fraction of nodes / edges expanded per layer |
+| `--explore` | `0.2` | share of the budget spent on random nodes (`learned`, training only) |
+| `--sparse_exec` | `true` | physical sparse execution; `false` runs the dense reference path |
+| `--seed` | `1024` | random seed |
 
-```bash
-python script/run.py -c config/inductive/wn18rr.yaml --gpus [0] --version v1
-```
+## 9. Results
 
-We provide the hyperparameters for each experiment in configuration files.
-All the configuration files can be found in `config/*/*.yaml`.
+Results will be added here once all runs finish (dataset: WN18RR / FB15k-237, `rho` = ..., seeds = ...).
 
-For experiments on inductive relation prediction, you need to additionally specify
-the split version with `--version v1`.
+| Method | MRR | Hits@1 | Hits@10 | Tail coverage | Edges kept | Time/epoch | Peak memory |
+|---|---|---|---|---|---|---|---|
+| full | TBD | TBD | TBD | TBD | 100% | TBD | TBD |
+| random | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| learned | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| learned + dist. loss | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| astar | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| astar + dist. loss | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
 
-To run NBFNet with multiple GPUs or multiple machines, use the following commands
+## 10. Limitations
 
-```bash
-python -m torch.distributed.launch --nproc_per_node=4 script/run.py -c config/inductive/wn18rr.yaml --gpus [0,1,2,3]
-```
+- Only DistMult messages and **sum** aggregation are supported. The original NBFNet uses PNA aggregation, so `full` here is NBFNet with sum aggregation, not the original PNA baseline.
+- All hidden dimensions must equal the input dimension.
+- The sparse path has its own overhead (sorting, unique operations, scorer), so real speedups depend on `rho`, graph size and GPU.
+- `astar` is a re-implementation of A*Net's priority function and selection rule inside this codebase, using one `rho` for both node and edge budgets (equal to A*Net with `degree_ratio = 1`). It is not the original TorchDrug code.
+- The distance target uses hop distance on the training graph, limited to `L` hops.
 
-```bash
-python -m torch.distributed.launch --nnodes=4 --nproc_per_node=4 script/run.py -c config/inductive/wn18rr.yaml --gpus [0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3]
-```
+## 11. References
 
-### Visualize Interpretations on FB15k-237 ###
+- Z. Zhu et al. *Neural Bellman-Ford Networks: A General Graph Neural Network Framework for Link Prediction.* NeurIPS 2021. Code: [NBFNet-PyG](https://github.com/KiddoZhu/NBFNet-PyG).
+- Z. Zhu et al. *A\*Net: A Scalable Path-based Reasoning Approach for Knowledge Graphs.* NeurIPS 2023. Code: [AStarNet](https://github.com/DeepGraphLearning/AStarNet).
 
-Once you have models trained on FB15k237, you can visualize the path interpretations
-with the following line. Please replace the checkpoint with your own path.
+## 12. Team
 
-```bash
-python script/visualize.py -c config/transductive/fb15k237_visualize.yaml --checkpoint /path/to/nbfnet/experiment/model_epoch_20.pth
-```
+Add names, roles and contributions here (who built the MLP pruner and distance loss, who ran the baseline, random and A*Net experiments).
 
-## Results ##
+## License
 
-Here are the benchmark results of this re-implementation. All the results are
-obtained with 4 V100 GPUs (32GB). Note results may be slightly different if the
-model is trained with 1 GPU and/or a smaller batch size.
-
-### Knowledge Graph Completion ###
-
-<table>
-    <tr>
-        <th>Dataset</th>
-        <th>MR</th>
-        <th>MRR</th>
-        <th>HITS@1</th>
-        <th>HITS@3</th>
-        <th>HITS@10</th>
-    </tr>
-    <tr>
-        <th>FB15k-237</th>
-        <td>113</td>
-        <td>0.416</td>
-        <td>0.322</td>
-        <td>0.456</td>
-        <td>0.602</td>
-    </tr>
-    <tr>
-        <th>WN18RR</th>
-        <td>650</td>
-        <td>0.551</td>
-        <td>0.496</td>
-        <td>0.573</td>
-        <td>0.661</td>
-    </tr>
-</table>
-
-<table>
-    <tr>
-        <th>Dataset</th>
-        <th>Training Time</th>
-        <th>Test Time</th>
-        <th>GPU Memory</th>
-    </tr>
-    <tr>
-        <th>FB15k-237</th>
-        <td>22.8 min / epoch</td>
-        <td>64 s</td>
-        <td>22.9 GiB</td>
-    </tr>
-    <tr>
-        <th>WN18RR</th>
-        <td>12.0 min / epoch</td>
-        <td>16 s</td>
-        <td>16.1 GiB</td>
-    </tr>
-</table>
-
-### Inductive Relation Prediction ###
-
-<table>
-    <tr>
-        <th rowspan="2">Dataset</th>
-        <th colspan="4">HITS@10 (50 sample)</th>
-    </tr>
-    <tr>
-        <th>v1</th>
-        <th>v2</th>
-        <th>v3</th>
-        <th>v4</th>
-    </tr>
-    <tr>
-        <th>FB15k-237</th>
-        <td>0.821</td>
-        <td>0.948</td>
-        <td>0.957</td>
-        <td>0.959</td>
-    </tr>
-    <tr>
-        <th>WN18RR</th>
-        <td>0.954</td>
-        <td>0.903</td>
-        <td>0.909</td>
-        <td>0.888</td>
-    </tr>
-</table>
-
-<table>
-    <tr>
-        <th rowspan=2>Dataset</th>
-        <th colspan=3>v1</th>
-        <th colspan=3>v2</th>
-        <th colspan=3>v3</th>
-        <th colspan=3>v4</th>
-    </tr>
-    <tr>
-        <th>Training Time</th>
-        <th>Test Time</th>
-        <th>GPU Memory</th>
-        <th>Training Time</th>
-        <th>Test Time</th>
-        <th>GPU Memory</th>
-        <th>Training Time</th>
-        <th>Test Time</th>
-        <th>GPU Memory</th>
-        <th>Training Time</th>
-        <th>Test Time</th>
-        <th>GPU Memory</th>
-    </tr>
-    <tr>
-        <th>FB15k-237</th>
-        <td>2 s / epoch</td>
-        <td>< 1 s</td>
-        <td>3.51 GiB</td>
-        <td>6 s / epoch</td>
-        <td>< 1 s</td>
-        <td>5.02 GiB</td>
-        <td>15 s / epoch</td>
-        <td>< 1 s</td>
-        <td>6.56 GiB</td>
-        <td>29 s / epoch</td>
-        <td>< 1 s</td>
-        <td>8.10 GiB</td>
-    </tr>
-    <tr>
-        <th>WN18RR</th>
-        <td>3 s / epoch</td>
-        <td>< 1 s</td>
-        <td>5.17 GiB</td>
-        <td>22 s / epoch</td>
-        <td>< 1 s</td>
-        <td>11.3 GiB</td>
-        <td>3 s / epoch</td>
-        <td>1 s</td>
-        <td>18.7 GiB</td>
-        <td>7 s / epoch</td>
-        <td>1 s</td>
-        <td>6.84 GiB</td>
-    </tr>
-</table>
-
-## Citation ##
-
-If you find this codebase useful in your research, please cite the original paper.
-
-```bibtex
-@article{zhu2021neural,
-  title={Neural bellman-ford networks: A general graph neural network framework for link prediction},
-  author={Zhu, Zhaocheng and Zhang, Zuobai and Xhonneux, Louis-Pascal and Tang, Jian},
-  journal={Advances in Neural Information Processing Systems},
-  volume={34},
-  year={2021}
-}
-```
+Inherits the license of NBFNet-PyG (see `LICENSE`).
